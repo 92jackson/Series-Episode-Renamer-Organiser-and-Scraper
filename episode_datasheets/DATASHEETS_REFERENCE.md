@@ -3,6 +3,7 @@
 This folder contains CSV episode data used by Episode Organiser.
 
 - `thomas_&_friends_(1984).csv`: episode data based on https://en.wikipedia.org/wiki/List_of_Thomas_%26_Friends_episodes, movie entries are based on https://www.imdb.com/list/ls098617186/.
+- `jack_&_the_sodor_construction_company_(2006).csv`: episode data based on https://www.imdb.com/title/tt2426370/episodes/
 
 ## Expected CSV Format
 
@@ -22,4 +23,31 @@ This folder contains CSV episode data used by Episode Organiser.
 
 - Encoding: UTF‑8 is recommended.
 - Extra columns are ignored.
+- Optional columns recognised for alternate title matching:
+- `alt_title`, `alt_titles` (semicolon‑separated), `aka`, `alternate_title`.
+- These help match files that use different wording for the episode title.
+
+### Filename character sanitization
+
+- Titles may include characters illegal on Windows (e.g. `?:<>"/\|*:`).
+- During renaming, these are automatically sanitized:
+  - `:` becomes ` - `, `/` and `\` become `-`.
+  - `?`, `*`, `<`, `>`, `"` are removed.
+  - Excess spaces are collapsed and trimmed.
+- You do not need to manually edit titles in the CSV to remove these.
+
+### Example with an alternate title
+
+Header:
+
+```
+"ep_no","series_ep_code","title","air_date","alt_title"
+```
+
+Row:
+
+```
+"013","s01e13","Percy Helps Out","2006-10-02","Jack & Jet Pack - Percy Helps Out"
+```
+
 - Season mapping: episodes go to `Season N` from `sXX`, films/specials go to `Season 0`.

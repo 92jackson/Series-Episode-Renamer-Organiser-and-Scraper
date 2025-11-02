@@ -1,4 +1,6 @@
 # Episode Organiser
+# https://github.com/92jackson/episode-organiser
+# v1.0.1
 
 # Global variables
 $cleanupFolder = "cleanup"
@@ -12,11 +14,13 @@ $script:cleanSeriesAnd = $null
 
 # Pre-compiled regex patterns for better performance
 $script:videoExtensionRegex = [regex]'\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v)$'
-$script:episodeCodeRegex = [regex]'s(\d{2})e(\d{2})'
+$script:episodeCodeRegex = [regex]'(?i)s(\d{2})\s*(?:e|ep)\s*(\d{2})'
 $script:decimalNumberRegex = [regex]'^\d+\.\d+$'
 $script:formatChoiceRegex = [regex]'^(1[0-3]|[1-9])$'
 $script:seriesCodeRegex = [regex]'^s(\d+)e\d+$'
 $script:filmCodeRegex = [regex]'^s00e\d+$'
+
+$script:suppressEpisodeNumberMismatch = $false
 
 # Video file caching for performance
 $script:videoFilesCache = $null
@@ -261,12 +265,92 @@ function Format-DiscrepancyInfo($discrepancyType, $discrepancyDetails) {
     return $result
 }
 
+# Write filename with inline colour highlighting for mismatched token
+function Write-FilenameWithMismatchHighlight($filename, $discrepancyDetails) {
+	# Determine all tokens to highlight (episode code, number, and/or extracted title)
+	$name = $filename
+	$ranges = @()
+
+	# Highlight episode code tokens when code mismatch is present
+	if ($discrepancyDetails -match "Extracted Code: '") {
+		$codeMatches = [regex]::Matches($name, "(?i)\b(s\d{2}\s*(?:e|ep)\s*\d{2}|(?:ep|e)\s*\d{1,3})\b")
+		foreach ($m in $codeMatches) {
+			$ranges += [PSCustomObject]@{ Start = $m.Index; End = ($m.Index + $m.Length) }
+		}
+	}
+
+	# Highlight leading numeric episode number when number mismatch is present
+	if ($discrepancyDetails -match "Extracted Ep: '") {
+		$numMatch = [regex]::Match($name, "^\s*(\d{1,3})")
+		if ($numMatch.Success) {
+			$ranges += [PSCustomObject]@{ Start = $numMatch.Groups[1].Index; End = ($numMatch.Groups[1].Index + $numMatch.Groups[1].Length) }
+		} else {
+			# Fallback: any standalone number token
+			$numAnywhere = [regex]::Match($name, "\b(\d{1,3})\b")
+			if ($numAnywhere.Success) {
+				$ranges += [PSCustomObject]@{ Start = $numAnywhere.Groups[1].Index; End = ($numAnywhere.Groups[1].Index + $numAnywhere.Groups[1].Length) }
+			}
+		}
+	}
+
+	# Highlight extracted title segment if a title mismatch exists and can be located
+	if ($discrepancyDetails -match "Extracted: '([^']+)' vs Reference: '") {
+		$extractedTitle = $matches[1]
+		if ($extractedTitle) {
+			$lowerName = $name.ToLower()
+			$lowerTitle = $extractedTitle.ToLower()
+			$idx = $lowerName.IndexOf($lowerTitle)
+			if ($idx -ge 0) {
+				$ranges += [PSCustomObject]@{ Start = $idx; End = ($idx + $extractedTitle.Length) }
+			}
+		}
+	}
+
+	# Merge overlapping ranges
+	$ranges = ($ranges | Sort-Object Start, End)
+	$merged = @()
+	foreach ($r in $ranges) {
+		if ($merged.Count -eq 0) { $merged += $r; continue }
+		$last = $merged[$merged.Count - 1]
+		if ($r.Start -le $last.End) {
+			$last.End = [math]::Max($last.End, $r.End)
+			$merged[$merged.Count - 1] = $last
+		} else {
+			$merged += $r
+		}
+	}
+
+	if ($merged.Count -gt 0) {
+		$current = 0
+		foreach ($mr in $merged) {
+			$prefixLen = $mr.Start - $current
+			if ($prefixLen -gt 0) { Write-Label $name.Substring($current, $prefixLen) -NoNewline }
+			$tokenLen = ($mr.End - $mr.Start)
+			Write-Warning $name.Substring($mr.Start, $tokenLen) -NoNewline
+			$current = $mr.End
+		}
+		if ($current -lt $name.Length) { Write-Label $name.Substring($current) -NoNewline }
+		return $true
+	} else {
+		# Fallback: print plain filename when token cannot be identified
+		Write-Label $name -NoNewline
+		return $false
+	}
+}
+
 # Normalise text for comparison
 function Normalise-Text($text) {
-    if (-not $text) { return "" }
-    # Convert to lowercase, remove all non-alphanumeric characters except spaces, normalize spaces, trim
-    $normalized = $text.ToLower() -replace '[^\w\s]', '' -replace '\s+', ' '
-    return $normalized.Trim()
+	if (-not $text) { return "" }
+	# Standardize common symbols/words before stripping punctuation
+	# - Convert curly apostrophes to straight
+	# - Treat '&' as the word 'and' (even without surrounding spaces)
+	# - Convert all hyphens to spaces
+	$pre = $text -replace '’', "'"
+	$pre = $pre -replace '&', ' and '
+	$pre = $pre -replace '-', ' '
+	# Convert to lowercase, remove all non-alphanumeric characters except spaces, normalize spaces, trim
+	$normalized = $pre.ToLower() -replace '[^\w\s]', '' -replace '\s+', ' '
+	return $normalized.Trim()
 }
 
 # Load episode data from CSV with optimised lookup tables
@@ -287,6 +371,18 @@ function Load-EpisodeData {
             SeriesEpisode = $rawEpisode.series_ep_code
             AirDate = $rawEpisode.air_date
         }
+        # Collect optional alternate titles from various common columns
+        $altTitles = @()
+        if ($rawEpisode.alt_title) { $altTitles += $rawEpisode.alt_title }
+        if ($rawEpisode.alt_titles) {
+            if ($rawEpisode.alt_titles -is [string] -and $rawEpisode.alt_titles.Trim()) {
+                $altTitles += ($rawEpisode.alt_titles -split ';')
+            }
+        }
+        if ($rawEpisode.aka) { $altTitles += $rawEpisode.aka }
+        if ($rawEpisode.alternate_title) { $altTitles += $rawEpisode.alternate_title }
+        # Attach AltTitles property for later lookup building
+        Add-Member -InputObject $episode -MemberType NoteProperty -Name AltTitles -Value $altTitles
         $episodes += $episode
     }
     
@@ -300,6 +396,13 @@ function Load-EpisodeData {
         $normalisedTitle = Normalise-Text $episode.Title
         if ($normalisedTitle) {
             $script:episodesByTitle[$normalisedTitle] = $episode
+        }
+        # Alternate titles lookup (normalised), if any
+        if ($episode.AltTitles) {
+            foreach ($alt in $episode.AltTitles) {
+                $nAlt = Normalise-Text $alt
+                if ($nAlt) { $script:episodesByTitle[$nAlt] = $episode }
+            }
         }
         
         # Number lookup
@@ -862,14 +965,34 @@ function Extract-Title($filename) {
     # Remove file extension
     $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($filename)
     
+    # Preserve part indicators like (Part 1) or (Pt 1) before stripping parentheses
+    $partSuffix = $null
+    $partMatch = [regex]::Match($nameWithoutExt, '(?i)\((?:part|pt)\s*([ivxlcdm]+|\d+)\)')
+    if ($partMatch.Success) {
+		$partVal = $partMatch.Groups[1].Value
+		$partSuffix = " (Part $partVal)"
+    }
+    
     # Remove common suffixes and prefixes
     $cleanName = $nameWithoutExt -replace '\.(ia|archive\.org)$', ''
     $cleanName = $cleanName -replace '\s*-\s*(720p|1080p|480p|HD|SD).*$', ''
     $cleanName = $cleanName -replace '\s*\[(.*?)\]', ''
     $cleanName = $cleanName -replace '\s*\((.*?)\)', ''
+
+	# If the filename contains an episode token (sXXeXX, sXX EpXX, EpXX, or eXX),
+	# capture the title segment after the token and a following dash/colon.
+	# Examples handled:
+	#   "S11 Ep24 - Ding-a-Ling" => "Ding-a-Ling"
+	#   "J&P Ep01 - A Visit from Thomas" => "A Visit from Thomas"
+	#   "s05e16-Thomas, Percy & Old Slow Coach" => "Thomas, Percy & Old Slow Coach"
+	if ($cleanName -match '^(?i).+?\b(?:s\d{2}\s*(?:e|ep)\s*\d{2}|(?:ep|e)\s*\d{1,3})\b\s*[-:]?\s*(.+)$') {
+		$cleanName = $matches[1]
+	}
     
-    # Remove episode codes
-    $cleanName = $cleanName -replace 's\d{2}e\d{2}', ''
+    # Remove episode codes (supports sXXeXX, SXXEXX, and SXX EpXX)
+    $cleanName = $cleanName -replace '(?i)s\d{2}\s*(?:e|ep)\s*\d{2}', ''
+    # Also remove bare EpXX/eXX tokens when present without a leading season
+    $cleanName = $cleanName -replace '(?i)\b(?:ep|e)\s*\d{1,3}\b', ''
     $cleanName = $cleanName -replace '\b\d+\.\d+\b', ''
     $cleanName = $cleanName -replace '\b\d{1,3}\b', ''
     
@@ -889,6 +1012,11 @@ function Extract-Title($filename) {
     $cleanName = $cleanName -replace '^[.\-\s]+', ''  # Remove leading dots, dashes, and spaces
     $cleanName = $cleanName -replace '[.\-\s]+$', ''  # Remove trailing dots, dashes, and spaces
     $cleanName = $cleanName.Trim()
+    
+    # Reattach preserved part indicator if present and not already included
+    if ($partSuffix -and $cleanName -and ($cleanName -notmatch '(?i)\bpart\s+([ivxlcdm]+|\d+)\b')) {
+		$cleanName = ("$cleanName$partSuffix").Trim()
+    }
     
     if ($cleanName) { 
         return $cleanName 
@@ -1086,72 +1214,105 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
     $extractedEpisodeNum = Extract-EpisodeNumber $file.Name $episodeData
     
     switch ($matchingPreference) {
-        1 { # Match with episode titles (with fallback to episode code)
-            if ($extractedTitle) {
-                $normalisedTitle = Normalise-Text $extractedTitle
-                # Try exact match first
-                if ($script:episodesByTitle.ContainsKey($normalisedTitle)) {
-                    return $script:episodesByTitle[$normalisedTitle]
-                }
+		1 { # Match with episode titles (with fallback to episode code)
+			if ($extractedTitle) {
+				$normalisedTitle = Normalise-Text $extractedTitle
+				# Try exact match first
+				if ($script:episodesByTitle.ContainsKey($normalisedTitle)) {
+					return $script:episodesByTitle[$normalisedTitle]
+				}
+				
+				# Try partial match
+				# Build candidate list and prefer same-part matches
+				$exPart = $null
+				if ($normalisedTitle -match '\bpart\s+([ivxlcdm]+|\d+)\b') { $exPart = $matches[1].ToLower() }
+				$candidates = @()
+				foreach ($title in $script:episodesByTitle.Keys) {
+					if ($title -like "*$normalisedTitle*" -or $normalisedTitle -like "*$title*") { $candidates += $title }
+				}
+				if ($candidates.Count -gt 0) {
+					if ($exPart) {
+						$preferred = $candidates | Where-Object { $_ -match "\bpart\s+$exPart\b" } | Select-Object -First 1
+						if ($preferred) { return $script:episodesByTitle[$preferred] }
+					}
+					# As a tie-breaker, if an episode code is present, prefer candidate with that episode's title
+					$code = Extract-EpisodeCode $file.Name
+					if ($code) {
+						$canonical = $code.ToLower()
+						if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
+							$ep = $script:episodesBySeriesEpisode[$canonical]
+							$matchKey = Normalise-Text $ep.Title
+							$matchedCandidate = $candidates | Where-Object { $_ -eq $matchKey } | Select-Object -First 1
+							if ($matchedCandidate) { return $script:episodesByTitle[$matchedCandidate] }
+						}
+					}
+					return $script:episodesByTitle[$candidates[0]]
+				}
+			} else {
+				# Only fallback to episode code if no title could be extracted
+				$code = Extract-EpisodeCode $file.Name
+				if ($code) {
+					$canonical = $code.ToLower()
+					if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
+						return $script:episodesBySeriesEpisode[$canonical]
+					}
+				}
+			}
+		}
+		
+		2 { # Match episode code (with fallback to title)
+			$code = Extract-EpisodeCode $file.Name
+			if ($code) {
+				$canonical = $code.ToLower()
+				if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
+					return $script:episodesBySeriesEpisode[$canonical]
+				}
+			}
+			
+			# Fallback to title matching
+			if ($extractedTitle) {
+				$normalisedTitle = Normalise-Text $extractedTitle
+				if ($script:episodesByTitle.ContainsKey($normalisedTitle)) {
+					return $script:episodesByTitle[$normalisedTitle]
+				}
                 
                 # Try partial match
-                foreach ($title in $script:episodesByTitle.Keys) {
-                    if ($title -like "*$normalisedTitle*" -or $normalisedTitle -like "*$title*") {
-                        return $script:episodesByTitle[$title]
-                    }
-                }
-            }
-            
-            # Fallback to episode code matching
-            if ($file.Name -match $script:episodeCodeRegex) {
-                $seriesEpisode = $matches[0].ToLower()
-                if ($script:episodesBySeriesEpisode.ContainsKey($seriesEpisode)) {
-                    return $script:episodesBySeriesEpisode[$seriesEpisode]
-                }
-            }
-        }
+				# Build candidate list and prefer same-part matches
+				$exPart = $null
+				if ($normalisedTitle -match '\bpart\s+([ivxlcdm]+|\d+)\b') { $exPart = $matches[1].ToLower() }
+				$candidates = @()
+				foreach ($title in $script:episodesByTitle.Keys) {
+					if ($title -like "*$normalisedTitle*" -or $normalisedTitle -like "*$title*") { $candidates += $title }
+				}
+				if ($candidates.Count -gt 0) {
+					if ($exPart) {
+						$preferred = $candidates | Where-Object { $_ -match "\bpart\s+$exPart\b" } | Select-Object -First 1
+						if ($preferred) { return $script:episodesByTitle[$preferred] }
+					}
+					return $script:episodesByTitle[$candidates[0]]
+				}
+			}
+		}
         
-        2 { # Match episode code (with fallback to title)
-            if ($file.Name -match $script:episodeCodeRegex) {
-                $seriesEpisode = $matches[0].ToLower()
-                if ($script:episodesBySeriesEpisode.ContainsKey($seriesEpisode)) {
-                    return $script:episodesBySeriesEpisode[$seriesEpisode]
-                }
-            }
-            
-            # Fallback to title matching
-            if ($extractedTitle) {
-                $normalisedTitle = Normalise-Text $extractedTitle
-                if ($script:episodesByTitle.ContainsKey($normalisedTitle)) {
-                    return $script:episodesByTitle[$normalisedTitle]
-                }
-                
-                # Try partial match
-                foreach ($title in $script:episodesByTitle.Keys) {
-                    if ($title -like "*$normalisedTitle*" -or $normalisedTitle -like "*$title*") {
-                        return $script:episodesByTitle[$title]
-                    }
-                }
-            }
-        }
-        
-        3 { # Strict matching (both episode code and title must match)
-            if ($file.Name -match $script:episodeCodeRegex -and $extractedTitle) {
-                $seriesEpisode = $matches[0].ToLower()
-                $episode = $script:episodesBySeriesEpisode[$seriesEpisode]
-                
-                if ($episode) {
-                    $normalisedExtracted = Normalise-Text $extractedTitle
-                    $normalisedReference = Normalise-Text $episode.Title
-                    
-                    if ($normalisedExtracted -eq $normalisedReference -or 
-                        $normalisedExtracted -like "*$normalisedReference*" -or 
-                        $normalisedReference -like "*$normalisedExtracted*") {
-                        return $episode
-                    }
-                }
-            }
-        }
+		3 { # Strict matching (both episode code and title must match)
+			if ($extractedTitle) {
+				$code = Extract-EpisodeCode $file.Name
+				if ($code) {
+					$episode = $script:episodesBySeriesEpisode[$code.ToLower()]
+				
+					if ($episode) {
+						$normalisedExtracted = Normalise-Text $extractedTitle
+						$normalisedReference = Normalise-Text $episode.Title
+						
+						if ($normalisedExtracted -eq $normalisedReference -or 
+							$normalisedExtracted -like "*$normalisedReference*" -or 
+							$normalisedReference -like "*$normalisedExtracted*") {
+							return $episode
+						}
+					}
+				}
+			}
+		}
         
         4 { # Match episode numbers (not recommended)
             if ($extractedEpisodeNum -and $script:episodesByNumber.ContainsKey($extractedEpisodeNum)) {
@@ -1189,9 +1350,9 @@ function Show-NamingFormats {
 		}
 	}
 	# Generate examples for each format (no extension)
-	$ex1 = Get-FormattedFilename $sampleEpisode 3 ""
+	$ex1 = Get-FormattedFilename $sampleEpisode 1 ""
 	$ex2 = Get-FormattedFilename $sampleEpisode 2 ""
-	$ex3 = Get-FormattedFilename $sampleEpisode 1 ""
+	$ex3 = Get-FormattedFilename $sampleEpisode 3 ""
 	$ex4 = Get-FormattedFilename $sampleEpisode 4 ""
 	$ex5 = Get-FormattedFilename $sampleEpisode 5 ""
 	$ex6 = Get-FormattedFilename $sampleEpisode 6 ""
@@ -1246,6 +1407,18 @@ function Show-NamingFormats {
 	Write-Host ""
 }
 
+function Sanitize-FileName([string]	$name) {
+	if ([string]::IsNullOrEmpty($name)) { return $name }
+	$name = $name -replace ':', ' - '
+	$name = $name -replace '[\\/]+', '-'
+	$name = $name -replace '\|', '-'
+	$name = $name -replace '[\?\*<>"]', ''
+	$name = $name -replace '\s{2,}', ' '
+	$name = $name.Trim()
+	$name = $name -replace '\s+$', ''
+	return $name
+}
+
 function Get-FormattedFilename($episode, $format, $extension) {
     # Format air date if available
     $airDateStr = ""
@@ -1268,40 +1441,40 @@ function Get-FormattedFilename($episode, $format, $extension) {
     
 	# Handle movies (s00eXX entries) differently
 	if ($episode.SeriesEpisode -and $episode.SeriesEpisode -match $script:filmCodeRegex) {
-        switch ($format) {
-            1 { return "$($episode.Number) - $($episode.Title)$extension" }
-            2 { return "$($episode.Title)$extension" }  # Just title for movies
-            3 { return "$seriesDisplay - $($episode.Title)$extension" }  # No series info for movies
-            4 { return "$($episode.Number). $($episode.Title)$extension" }  # No series info for movies
-            5 { return "$($episode.Title)$airDateStr$extension" }  # Movie title with air date
-            6 { return "$($episode.Number) - $($episode.Title)$airDateStr$extension" }
-            7 { return "$seriesDisplay - $($episode.Title)$airDateStr$extension" }
-            8 { return "$($episode.Title)$extension" }  # Title only
-            9 { return "$($cleanTitle)$extension" }  # Dot notation title only
-            10 { return "$cleanSeries.$($cleanTitle)$extension" }  # Series.Title
-            11 { return "[$seriesDisplay] - $($episode.Title)$extension" }  # Bracketed series
-            12 { return "$cleanSeriesAnd.$($cleanTitle)$extension" }  # Series.and.Title
-            default { return "$($episode.Number) - $($episode.Title)$extension" }
-        }
-    } else {
+		switch ($format) {
+			1 { return (Sanitize-FileName "$seriesDisplay - $($episode.Title)$extension") }
+			2 { return (Sanitize-FileName "$($episode.Title)$extension") }
+			3 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
+			4 { return (Sanitize-FileName "$($episode.Number). $($episode.Title)$extension") }
+			5 { return (Sanitize-FileName "$($episode.Title)$airDateStr$extension") }
+			6 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$airDateStr$extension") }
+			7 { return (Sanitize-FileName "$seriesDisplay - $($episode.Title)$airDateStr$extension") }
+			8 { return (Sanitize-FileName "$($episode.Title)$extension") }
+			9 { return (Sanitize-FileName "$($cleanTitle)$extension") }
+			10 { return (Sanitize-FileName "$cleanSeries.$($cleanTitle)$extension") }
+			11 { return (Sanitize-FileName "[$seriesDisplay] - $($episode.Title)$extension") }
+			12 { return (Sanitize-FileName "$cleanSeriesAnd.$($cleanTitle)$extension") }
+			default { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
+		}
+	} else {
 		# Handle regular episodes
 		$upperSeriesEpisode = if ($episode.SeriesEpisode) { $episode.SeriesEpisode.ToUpper() } else { "" }
-        switch ($format) {
-            1 { return "$($episode.Number) - $($episode.Title)$extension" }
-            2 { return "$($episode.SeriesEpisode) - $($episode.Title)$extension" }
-            3 { return "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$extension" }
-            4 { return "$($episode.Number). $($episode.SeriesEpisode) - $($episode.Title)$extension" }
-            5 { return "$($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension" }
-            6 { return "$($episode.Number) - $($episode.Title)$airDateStr$extension" }
-            7 { return "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension" }
-            8 { return "$($episode.Title)$extension" }  # Title only
-            9 { return "$upperSeriesEpisode.$cleanTitle$extension" }  # SXXeXX.Title
-            10 { return "$cleanSeries.$upperSeriesEpisode.$cleanTitle$extension" }  # Series.SXXEXX.Title
-            11 { return "[$seriesDisplay] - $($episode.SeriesEpisode) - $($episode.Title)$extension" }  # Bracketed series
-            12 { return "$cleanSeriesAnd.$($episode.SeriesEpisode).$cleanTitle$extension" }  # Series.sXXeXX.Title
-            default { return "$($episode.Number) - $($episode.Title)$extension" }
-        }
-    }
+		switch ($format) {
+			1 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
+			2 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$extension") }
+			3 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
+			4 { return (Sanitize-FileName "$($episode.Number). $($episode.SeriesEpisode) - $($episode.Title)$extension") }
+			5 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
+			6 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$airDateStr$extension") }
+			7 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
+			8 { return (Sanitize-FileName "$($episode.Title)$extension") }
+			9 { return (Sanitize-FileName "$upperSeriesEpisode.$cleanTitle$extension") }
+			10 { return (Sanitize-FileName "$cleanSeries.$upperSeriesEpisode.$cleanTitle$extension") }
+			11 { return (Sanitize-FileName "[$seriesDisplay] - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
+			12 { return (Sanitize-FileName "$cleanSeriesAnd.$($episode.SeriesEpisode).$cleanTitle$extension") }
+			default { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
+		}
+	}
 }
 
 # Get Plex-compatible series folder name from episode data
@@ -1320,7 +1493,7 @@ function Get-SeriesFolderName($episode) {
 }
 
 # Generate detailed analysis report for files
-function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 3) {
+function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 1) {
     $episodeData = Load-EpisodeData
     $videoFiles = Get-VideoFiles
     
@@ -1343,16 +1516,23 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 3) {
     Write-Host ""
     
     foreach ($file in $videoFiles) {
-        # Skip .ia files if they have duplicates (they'll be handled separately)
-        $isDuplicate = $false
-        foreach ($dup in $duplicates) {
-            if ($dup.IAFile.FullName -eq $file.FullName -or $dup.OrigFile.FullName -eq $file.FullName) {
-                $isDuplicate = $true
-                break
-            }
-        }
-        
-        if ($isDuplicate) { continue }
+		# For traditional .ia duplicates, skip only the file that will be moved,
+		# and still process the file we’re keeping so it appears in renames.
+		$skipThisFile = $false
+		foreach ($dup in $duplicates) {
+			if ($dup.IAFile -and $dup.OrigFile) {
+				if ($dup.IAFile.FullName -eq $file.FullName -or $dup.OrigFile.FullName -eq $file.FullName) {
+					# Decide which file is moved to cleanup/duplicates
+					$moveFile = if ($dup.KeepIA) { $dup.OrigFile } else { $dup.IAFile }
+					if ($moveFile.FullName -eq $file.FullName) {
+						$skipThisFile = $true
+					}
+					break
+				}
+			}
+		}
+		
+		if ($skipThisFile) { continue }
         
         $matchedEpisode = Find-MatchingEpisode $file $episodeData $matchingPreference
         
@@ -1377,14 +1557,15 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 3) {
                 }
             }
             
-            # Check episode number discrepancy
-            $extractedEpisodeNum = Extract-EpisodeNumber $file.Name $episodeData
-            if ($extractedEpisodeNum -and $extractedEpisodeNum -ne $matchedEpisode.Number) {
-                $hasDiscrepancy = $true
-                $discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Number Mismatch" } else { "Episode Number Mismatch" }
-                $discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
-                $discrepancyDetails += "Extracted Ep: '$extractedEpisodeNum' vs Reference Ep: '$($matchedEpisode.Number)'"
-            }
+			# Check episode number discrepancy (respect suppression unless matching by episode number)
+			$extractedEpisodeNum = Extract-EpisodeNumber $file.Name $episodeData
+			$shouldSuppressNumMismatch = $script:suppressEpisodeNumberMismatch -and ($matchingPreference -ne 4)
+			if (-not $shouldSuppressNumMismatch -and $extractedEpisodeNum -and $extractedEpisodeNum -ne $matchedEpisode.Number) {
+				$hasDiscrepancy = $true
+				$discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Number Mismatch" } else { "Episode Number Mismatch" }
+				$discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
+				$discrepancyDetails += "Extracted Ep: '$extractedEpisodeNum' vs Reference Ep: '$($matchedEpisode.Number)'"
+			}
             
             # Check episode code discrepancy
             $extractedEpisodeCode = Extract-EpisodeCode $file.Name
@@ -1422,33 +1603,30 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 3) {
     
     $renameConflicts = Find-RenameConflicts $allRenames
     
-    # Handle rename conflicts by moving conflicting files to duplicates
+    # Handle rename conflicts by moving conflicting files to duplicates (silent here; listed in report later)
     foreach ($conflict in $renameConflicts) {
-        Write-Warning "Rename conflict detected: Multiple files trying to rename to '$($conflict.TargetPath)'"
-        
-        # Keep the first file as proposed, move others to duplicates
-        $filesToMove = $conflict.ConflictingFiles | Select-Object -Skip 1
-        
-        foreach ($conflictingRename in $filesToMove) {
-            # Create a duplicate entry for this conflicting file
-            $duplicateInfo = @{
-                IAFile = $null  # Not an .ia duplicate
-                OrigFile = $conflictingRename.File
-                KeepIA = $false  # Keep the original, move this one
-                ConflictType = "Rename Collision"
-                TargetPath = $conflict.TargetPath
-            }
+		# Keep the first file as proposed, move others to duplicates
+		$filesToMove = $conflict.ConflictingFiles | Select-Object -Skip 1
+		foreach ($conflictingRename in $filesToMove) {
+			# Create a duplicate entry for this conflicting file
+			$duplicateInfo = @{
+				IAFile = $null
+				OrigFile = $conflictingRename.File
+				KeepIA = $false
+				ConflictType = "Rename Collision"
+				TargetPath = $conflict.TargetPath
+			}
 
-            # Ensure the conflicting file is not left in other lists and add to duplicates
-            $tempReport = @{
-                ProposedRenames = $proposedRenames
-                Discrepancies   = $discrepancies
-                UnmatchedFiles  = $unmatchedFiles
-                SkippedFiles    = New-Object System.Collections.ArrayList
-                Duplicates      = $duplicates
-            }
-            Set-ReportCategory $tempReport 'Duplicates' $duplicateInfo
-        }
+			# Ensure the conflicting file is not left in other lists and add to duplicates
+			$tempReport = @{
+				ProposedRenames = $proposedRenames
+				Discrepancies   = $discrepancies
+				UnmatchedFiles  = $unmatchedFiles
+				SkippedFiles    = New-Object System.Collections.ArrayList
+				Duplicates      = $duplicates
+			}
+			Set-ReportCategory $tempReport 'Duplicates' $duplicateInfo
+		}
     }
     
     return @{
@@ -1557,7 +1735,6 @@ function Get-ActualDiscrepanciesCount($report) {
 # Display detailed report with colour coding
 function Show-DetailedReport($report) {
     Clear-Host
-    Write-Host ""
     Write-Success "=== DETAILED ANALYSIS REPORT ==="
     Write-Host ""
     
@@ -1662,34 +1839,47 @@ function Show-DetailedReport($report) {
 		if ($renamesToShow.Count -gt 0) {
 			Write-Success "=== PROPOSED RENAMES (PLEX FOLDER STRUCTURE) ==="
 			
-			# Group by series folder
-			$groupedRenames = $allRenames | Group-Object SeriesFolder | Sort-Object Name
+			# Group by series folder and sort by season number (numeric), then name
+			$groupedRenames = ($allRenames | Group-Object SeriesFolder) |
+				Sort-Object {
+					$seasonMatch = [regex]::Match($_.Name, '(?i)Season\s+(\d+)')
+					if ($seasonMatch.Success) { [int]$seasonMatch.Groups[1].Value } else { 9999 }
+				}, Name
 			foreach ($group in $groupedRenames) {
 				$displayItems = @($group.Group | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne (Join-Path $rootPath $_.SeriesFolder) })
+				# Sort items within a season by series code (sXXeXX) then global episode number
+				$sortedItems = $displayItems |
+					Sort-Object {
+						if ($_.Episode -and $_.Episode.SeriesEpisode) { $_.Episode.SeriesEpisode } else { 's99e99' }
+					}, {
+						if ($_.Episode -and $_.Episode.Number) { [int]$_.Episode.Number } else { [int]::MaxValue }
+					}
 				if ($displayItems.Count -gt 0) {
 					Write-Info "[FOLDER] " -NoNewline
 					Write-Primary "$($group.Name)/ " -NoNewline
 					Write-Label "($($displayItems.Count) files)"
-					foreach ($rename in $displayItems) {
+					foreach ($rename in $sortedItems) {
 						$isFolderOnly = ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder))
 						if ($isFolderOnly) {
 							# Folder-only move: show filename without arrow
 							Write-Host "   " -NoNewline
 							Write-Label "$($rename.File.Name)"
 						} else {
-							# Actual rename
-							Write-Host "   " -NoNewline
+						# Actual rename
+						Write-Host "   " -NoNewline
+						if ($rename.HasDiscrepancy) {
+							$null = Write-FilenameWithMismatchHighlight $rename.File.Name $rename.DiscrepancyDetails
+						} else {
 							Write-Label "$($rename.File.Name)" -NoNewline
-							Write-Warning " -> " -NoNewline
-							
-							# Use yellow for discrepancies (predicted matches), green for confirmed matches
-							if ($rename.HasDiscrepancy) {
-								$discrepancyInfo = Format-DiscrepancyInfo $rename.DiscrepancyType $rename.DiscrepancyDetails
-								Write-Warning "$($rename.NewName) " -NoNewline
-								Write-Label "[$discrepancyInfo]"
-							} else {
-								Write-Success "$($rename.NewName)"
-							}
+						}
+						Write-Warning " -> " -NoNewline
+						
+						# Use yellow for discrepancies (predicted matches), green for confirmed matches
+						if ($rename.HasDiscrepancy) {
+							Write-Success "$($rename.NewName)"
+						} else {
+							Write-Success "$($rename.NewName)"
+						}
 						}
 					}
 					Write-Host ""
@@ -1712,26 +1902,20 @@ function Show-DetailedReport($report) {
 		Write-Label "($(Get-DuplicateCount $report.Duplicates) files)"
 		foreach ($dup in $report.Duplicates) {
 			if ($dup.ConflictType -eq "Rename Collision") {
-				# This is a rename conflict duplicate
+				# This is a rename conflict duplicate (concise one-line format)
 				Write-Host "   " -NoNewline
+				Write-Error "[RENAME CONFLICT] " -NoNewline
 				Write-Label "$($dup.OrigFile.Name)" -NoNewline
 				Write-Warning " -> " -NoNewline
-				Write-Error "$($dup.OrigFile.Name)"
-				Write-Host "      " -NoNewline
-				Write-Error "[RENAME CONFLICT] " -NoNewline
-				Write-Label "Multiple files would rename to same name"
+				Write-Label "$($dup.OrigFile.Name)"
 			} else {
 				# This is a traditional .ia duplicate
 				$keepFile = if ($dup.KeepIA) { $dup.IAFile } else { $dup.OrigFile }
 				$moveFile = if ($dup.KeepIA) { $dup.OrigFile } else { $dup.IAFile }
 				
 				Write-Host "   " -NoNewline
-				Write-Label "$($moveFile.Name)" -NoNewline
-				Write-Warning " -> " -NoNewline
-				Write-Error "$($moveFile.Name)"
-				Write-Host "      " -NoNewline
 				Write-Error "[DUPLICATE] " -NoNewline
-				Write-Label "Keep larger: $($keepFile.Name)"
+				Write-Label "$($moveFile.Name)"
 			}
 		}
 		Write-Host ""
@@ -1742,21 +1926,17 @@ function Show-DetailedReport($report) {
 		Write-Info "[FOLDER] " -NoNewline
 		Write-Primary "cleanup/unknown/ " -NoNewline
 		Write-Label "($($report.UnmatchedFiles.Count) files)"
-		foreach ($file in $report.UnmatchedFiles) {
-			Write-Host "   " -NoNewline
-			Write-Label "$($file.Name)" -NoNewline
-			Write-Warning " -> " -NoNewline
-			Write-Error "$($file.Name)"
-			Write-Host "      " -NoNewline
-			Write-Error "[UNMATCHED] " -NoNewline
-            Write-Label "No episode match found"
-        }
+	foreach ($file in $report.UnmatchedFiles) {
+		Write-Host "   " -NoNewline
+		Write-Error "[UNMATCHED]  " -NoNewline
+		Write-Label "$($file.Name)"
+	}
         Write-Host ""
     }
 }
 
 # Quick rename and cleanup main function
-function Quick-RenameAndCleanup($namingFormat = 3) {
+function Quick-RenameAndCleanup($namingFormat = 1) {
 	Clear-Host
 	Write-Info "=== QUICK RENAME AND CLEAN-UP ==="
 	Write-Host ""
@@ -1783,15 +1963,15 @@ function Quick-RenameAndCleanup($namingFormat = 3) {
 	}
     
     # Generate detailed report
-    Write-Info "Generating detailed analysis report..."
+    Write-Info "Generating detailed analysis report... this may take a while..."
     $report = Generate-FileAnalysisReport $matchingPreference $namingFormat
     
     # Show detailed report
     Show-DetailedReport $report
     
-    # Calculate action summary
+    # Calculate simplified action summary
     $totalActions = 0
-    $actionSummary = @()
+    $acceptSummary = ""
     
     # Get list of files that are duplicates (to exclude from discrepancy count)
     $duplicateFilePaths = @()
@@ -1811,37 +1991,74 @@ function Quick-RenameAndCleanup($namingFormat = 3) {
 	$actualProposedRenames = @($report.ProposedRenames | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne (Join-Path $rootPath $_.SeriesFolder) })
 	$alreadyOptimalPR = @($report.ProposedRenames | Where-Object { $_.File.Name -eq $_.NewName -and $_.File.DirectoryName -eq (Join-Path $rootPath $_.SeriesFolder) })
 
-    if ($actualProposedRenames.Count -gt 0) {
-        $totalActions += $actualProposedRenames.Count
-        $actionSummary += "Rename or move $($actualProposedRenames.Count) files"
-    }
+	# Filter discrepancies to exclude files that are duplicates
+	$actualDiscrepancies = @($report.Discrepancies | Where-Object { $_.File.FullName -notin $duplicateFilePaths })
+	$discrepancyCount = $actualDiscrepancies.Count
+
+	# Compute total files to rename/move as a union of proposed renames and discrepancies
+	$renameItems = @()
+	$renameItems += $actualProposedRenames
+	$renameItems += $actualDiscrepancies
+	$uniqueRenameItems = $renameItems | Group-Object { $_.File.FullName } | ForEach-Object { $_.Group[0] }
+	$renameCount = $uniqueRenameItems.Count
+	if ($renameCount -gt 0) { $totalActions += $renameCount }
 	# Do not include already-optimally-named files in action summary
-    
-    # Filter discrepancies to exclude files that are duplicates
-    $actualDiscrepancies = @($report.Discrepancies | Where-Object { $_.File.FullName -notin $duplicateFilePaths })
-    if ($actualDiscrepancies.Count -gt 0) {
-        $totalActions += $actualDiscrepancies.Count
-        $actionSummary += "Rename $($actualDiscrepancies.Count) files with discrepancies"
-    }
-    
-    if ($report.Duplicates.Count -gt 0) {
-        $totalActions += $report.Duplicates.Count
-        $actionSummary += "Move $($report.Duplicates.Count) duplicate files to cleanup/duplicates/"
-    }
-    
-    if ($report.UnmatchedFiles.Count -gt 0) {
-        $totalActions += $report.UnmatchedFiles.Count
-        $actionSummary += "Move $($report.UnmatchedFiles.Count) unmatched files to cleanup/unknown/"
+	
+	$dupCount = $report.Duplicates.Count
+	if ($dupCount -gt 0) { $totalActions += $dupCount }
+	
+	$unmatchedCount = $report.UnmatchedFiles.Count
+	if ($unmatchedCount -gt 0) { $totalActions += $unmatchedCount }
+
+	# Build simplified accept summary text
+	if ($renameCount -gt 0) {
+		$filePlural = if ($renameCount -eq 1) { "file" } else { "files" }
+		$acceptSummary = "Rename $renameCount $filePlural"
+		if ($discrepancyCount -gt 0) {
+			$pluralWord = if ($discrepancyCount -eq 1) { "has" } else { "have" }
+			$pluralSuffix = if ($discrepancyCount -eq 1) { "" } else { "s" }
+			$acceptSummary += " ($discrepancyCount file$pluralSuffix $pluralWord discrepancies)"
+		}
+		$acceptSummary += " and organise into directories"
+	}
+    if ($dupCount -gt 0 -and $unmatchedCount -gt 0) {
+        $dupWord = if ($dupCount -eq 1) { "duplicate file" } else { "duplicate files" }
+        $unmatchedWord = if ($unmatchedCount -eq 1) { "unmatched file" } else { "unmatched files" }
+        $acceptSummary += ", Move $dupCount $dupWord and $unmatchedCount $unmatchedWord to cleanup/"
+    } elseif ($dupCount -gt 0) {
+        $dupWord = if ($dupCount -eq 1) { "duplicate file" } else { "duplicate files" }
+        $acceptSummary += ", Move $dupCount $dupWord to cleanup/"
+    } elseif ($unmatchedCount -gt 0) {
+        $unmatchedWord = if ($unmatchedCount -eq 1) { "unmatched file" } else { "unmatched files" }
+        $acceptSummary += ", Move $unmatchedCount $unmatchedWord to cleanup/"
     }
     
     # Show options
     Write-Info "=== OPTIONS ==="
     if ($totalActions -gt 0) {
         Write-Info " 1. " -NoNewline
-        Write-Primary "Accept all changes " -NoNewline
-        Write-Label "(" -NoNewline
-        Write-Success ($actionSummary -join ", ") -NoNewline
-        Write-Label ")"
+        Write-Primary "Accept all changes"
+		
+		# Indented grey list for action breakdown
+		if ($renameCount -gt 0) {
+			$filePlural = if ($renameCount -eq 1) { "file" } else { "files" }
+			$line = "    - Rename $renameCount $filePlural"
+			if ($discrepancyCount -gt 0) {
+				$pluralWord = if ($discrepancyCount -eq 1) { "has" } else { "have" }
+				$pluralSuffix = if ($discrepancyCount -eq 1) { "" } else { "s" }
+				$line += " ($discrepancyCount file$pluralSuffix $pluralWord discrepancies)"
+			}
+			Write-Label $line
+			Write-Label "    - Organise into directories"
+		}
+		if ($dupCount -gt 0) {
+			$dupWord = if ($dupCount -eq 1) { "duplicate file" } else { "duplicate files" }
+			Write-Label "    - Move $dupCount $dupWord to cleanup/"
+		}
+		if ($unmatchedCount -gt 0) {
+			$unmatchedWord = if ($unmatchedCount -eq 1) { "unmatched file" } else { "unmatched files" }
+			Write-Label "    - Move $unmatchedCount $unmatchedWord to cleanup/"
+		}
         
         if ($actualDiscrepancies.Count -gt 0) {
             Write-Info " 2. " -NoNewline
@@ -2003,10 +2220,12 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
             # Move and rename files into the folder
             foreach ($rename in $group.Group) {
                 try {
-                    $targetPath = Join-Path $folderName $rename.NewName
-                    $originalPath = $rename.File.FullName
-                    # Skip if target equals current full path (true no-op)
-					$targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $folderName $rename.NewName))
+					$originalPath = $rename.File.FullName
+					# Respect skip-renaming when determining the target name
+					$targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
+					$targetPath = Join-Path $folderName $targetName
+					# Skip if target equals current full path (true no-op)
+					$targetFullPath = [System.IO.Path]::GetFullPath($targetPath)
 					if ($targetFullPath -eq $rename.File.FullName) { continue }
 
                     if (Test-Path $targetPath) {
@@ -2016,7 +2235,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
                     
 				# Respect skip-renaming: keep original filename if set
 				$targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
-				$targetPath = Join-Path $folderDir $targetName
+				$targetPath = Join-Path $folderName $targetName
 				# Journal move/rename for restore
 				Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
 				Move-Item -Path $rename.File.FullName -Destination $targetPath
@@ -2029,7 +2248,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 				# Process sidecars if enabled
 				if ($processSidecars) {
 					if ($script:skipRenaming) {
-						Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderDir
+						Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderName
 					} else {
 						RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
 					}
@@ -2087,43 +2306,49 @@ function Guided-CustomRenameAndCleanup {
 	}
     
     # Generate initial analysis
-    Write-Info "Analysing your files..."
+    Write-Info "Analysing your files... this may take a while..."
     $report = Generate-FileAnalysisReport $matchingPreference
     
-    # Step 1: Preview duplicates and unknown files (defer actual moves)
-    if ($report.Duplicates.Count -gt 0 -or $report.UnmatchedFiles.Count -gt 0) {
-        Clear-Host
-        Write-Host ""
-        Write-Success "=== STEP 1: REVIEW DUPLICATES AND UNKNOWN FILES ==="
+	# Step 1: Preview duplicates and unknown files (defer actual moves)
+	if ($report.Duplicates.Count -gt 0 -or $report.UnmatchedFiles.Count -gt 0) {
+		Clear-Host
+		Write-Host ""
+		Write-Success "=== STEP 1: REVIEW DUPLICATES AND UNKNOWN FILES ==="
 
-        if ($report.Duplicates.Count -gt 0) {
-            Write-Host "Duplicates detected: " -NoNewline
-            Write-Warning "$(Get-DuplicateCount $report.Duplicates) duplicate pairs"
-            foreach ($dup in $report.Duplicates) {
-                if ($dup.ConflictType -eq "Rename Collision") {
-                    # This is a rename conflict duplicate
-                    Write-Host "  Move: " -NoNewline
-                    Write-Warning "$($dup.OrigFile.Name) -> cleanup/duplicates/ (rename conflict)"
-                } else {
-                    # This is a traditional .ia duplicate
-                    $keepFile = if ($dup.KeepIA) { $dup.IAFile } else { $dup.OrigFile }
-                    $moveFile = if ($dup.KeepIA) { $dup.OrigFile } else { $dup.IAFile }
-                    Write-Host "  Keep: " -NoNewline
-                    Write-Success "$($keepFile.Name)"
-                    Write-Host "  Move: " -NoNewline
-                    Write-Warning "$($moveFile.Name) -> cleanup/duplicates/"
-                }
-            }
-        }
+		# Duplicates section (compact quick-style)
+		if ($report.Duplicates.Count -gt 0) {
+			Write-Info "[FOLDER] " -NoNewline
+			Write-Primary "cleanup/duplicates/ " -NoNewline
+			Write-Label "($(Get-DuplicateCount $report.Duplicates) files)"
+			foreach ($dup in $report.Duplicates) {
+				if ($dup.ConflictType -eq "Rename Collision") {
+					Write-Host "   " -NoNewline
+					Write-Error "[RENAME CONFLICT] " -NoNewline
+					Write-Label "$($dup.OrigFile.Name)" -NoNewline
+					Write-Warning " -> " -NoNewline
+					Write-Label "$($dup.OrigFile.Name)"
+				} else {
+					$moveFile = if ($dup.KeepIA) { $dup.OrigFile } else { $dup.IAFile }
+					Write-Host "   " -NoNewline
+					Write-Error "[DUPLICATE] " -NoNewline
+					Write-Label "$($moveFile.Name)"
+				}
+			}
+			Write-Host ""
+		}
 
-        if ($report.UnmatchedFiles.Count -gt 0) {
-            Write-Host "Unmatched files: " -NoNewline
-            Write-Warning "$($report.UnmatchedFiles.Count) files"
-            foreach ($file in $report.UnmatchedFiles) {
-                Write-Host "  Move: " -NoNewline
-                Write-Warning "$($file.Name) -> cleanup/unknown/"
-            }
-        }
+		# Unknown files section (compact quick-style)
+		if ($report.UnmatchedFiles.Count -gt 0) {
+			Write-Info "[FOLDER] " -NoNewline
+			Write-Primary "cleanup/unknown/ " -NoNewline
+			Write-Label "($($report.UnmatchedFiles.Count) files)"
+			foreach ($file in $report.UnmatchedFiles) {
+				Write-Host "   " -NoNewline
+				Write-Error "[UNMATCHED]  " -NoNewline
+				Write-Label "$($file.Name)"
+			}
+			Write-Host ""
+		}
 
 		Write-Host ""
 		# Ask combined preference for moving duplicates and unmatched files at final confirmation
@@ -2167,12 +2392,8 @@ function Guided-CustomRenameAndCleanup {
 		# Use a script-scoped flag so downstream functions can avoid renaming
 		$script:skipRenaming = $true
 	} else {
-		# Map displayed option numbers to internal format IDs (option 1 -> format 3)
-		$displayToFormat = @{
-			'1' = 3; '2' = 2; '3' = 1; '4' = 4; '5' = 5; '6' = 6; '7' = 7; '8' = 8; '9' = 9; '10' = 10; '11' = 11; '12' = 12; '13' = 13
-		}
-		$namingFormat = [int]$displayToFormat[$formatChoice]
-		Write-Success "Using chosen naming format: $formatChoice -> $namingFormat"
+		$namingFormat = [int]$formatChoice
+		Write-Success "Using renaming format: $formatChoice"
 		
 		# Regenerate report with the chosen format
 		$report = Generate-FileAnalysisReport $matchingPreference $namingFormat
@@ -2249,8 +2470,12 @@ function Guided-CustomRenameAndCleanup {
 	if ($report.ProposedRenames.Count -gt 0) {
 		Write-Info "Your files can be organised into Plex-compatible folder structure:"
 		
-		# Show folder preview
-		$groupedRenames = $report.ProposedRenames | Group-Object SeriesFolder | Sort-Object Name
+		# Show folder preview (sorted by Season number, then name)
+		$groupedRenames = ($report.ProposedRenames | Group-Object SeriesFolder) |
+			Sort-Object {
+				$seasonMatch = [regex]::Match($_.Name, '(?i)Season\s+(\d+)')
+				if ($seasonMatch.Success) { [int]$seasonMatch.Groups[1].Value } else { 9999 }
+			}, Name
 		foreach ($group in $groupedRenames) {
 			Write-Info "[FOLDER] $($group.Name)/ ($($group.Group.Count) files)"
 		}
@@ -2499,14 +2724,16 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
             }
         }
         
-        # Move and rename files into the folder
+        # Move and (optionally) rename files into the folder
         foreach ($rename in ($group.Group | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne $_.SeriesFolder })) {
             try {
-                $targetPath = Join-Path $folderName $rename.NewName
+                # Respect skip-renaming option 13
+                $targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
+                $targetPath = Join-Path $folderName $targetName
                 $originalPath = $rename.File.FullName
-                
+
                 # Skip if target equals current full path (true no-op)
-					$targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $folderName $rename.NewName))
+					$targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $folderName $targetName))
 					if ($targetFullPath -eq $rename.File.FullName) { continue }
 
                 if (Test-Path $targetPath) {
@@ -2517,14 +2744,19 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
                 	# Journal move/rename for restore
                 	Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
                 	Move-Item -Path $rename.File.FullName -Destination $targetPath
-				if ($rename.File.Name -ne $rename.NewName) {
+				$didRename = (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName))
+				if ($didRename) {
 					Write-Success "Organised: $($rename.File.Name) -> $folderName/$($rename.NewName)"
 				} else {
 					Write-Success "Moved: $($rename.File.Name) -> $folderName/"
 				}
                 # Process sidecars if enabled
                 if ($processSidecars) {
-                	RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
+                	if ($script:skipRenaming) {
+                		Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderName
+                	} else {
+                		RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
+                	}
                 }
 				$successCount++
             }
@@ -2615,7 +2847,11 @@ function Show-FinalSummaryAndConfirm($report, $organisePlex = $false, $moveDupli
     
     # Describe Plex organisation if enabled
     if ($organisePlex) {
-        $actionSummary += "Organise renamed files into Plex-compatible series folders"
+        if ($script:skipRenaming) {
+            $actionSummary += "Organise files into Plex-compatible series folders"
+        } else {
+            $actionSummary += "Organise renamed files into Plex-compatible series folders"
+        }
     }
     # Describe subtitle/thumbnail processing if enabled and there are renames/moves
     if ($processSidecars -and $totalRenames -gt 0) {
@@ -2669,19 +2905,38 @@ function Show-FinalSummaryAndConfirm($report, $organisePlex = $false, $moveDupli
             Write-Host ""
             
             if ($organisePlex) {
-                # Show organised by folders
-                $groupedRenames = ($renamesOnly + $folderOnlyMoves) | Group-Object SeriesFolder | Sort-Object Name
+                # Show organised by folders, sorted by Season, then episode
+                $groupedRenames = (($renamesOnly + $folderOnlyMoves) | Group-Object SeriesFolder) |
+                	Sort-Object {
+                		$seasonMatch = [regex]::Match($_.Name, '(?i)Season\s+(\d+)')
+                		if ($seasonMatch.Success) { [int]$seasonMatch.Groups[1].Value } else { 9999 }
+                	}, Name
                 foreach ($group in $groupedRenames) {
                     Write-Info "[FOLDER] $($group.Name)/"
-                    foreach ($rename in $group.Group) {
-					$rootPath = (Get-Location).Path
-					$isFolderOnly = ($script:skipRenaming -or ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder)))
+                	# Sort files inside folder by series code and episode number
+                	$sortedItems = @($group.Group) |
+                		Sort-Object {
+                			if ($_.Episode -and $_.Episode.SeriesEpisode) { $_.Episode.SeriesEpisode } else { 's99e99' }
+                		}, {
+                			if ($_.Episode -and $_.Episode.Number) { [int]$_.Episode.Number } else { [int]::MaxValue }
+                		}, {
+                			$_.File.Name
+                		}
+                    foreach ($rename in $sortedItems) {
+                    	$rootPath = (Get-Location).Path
+                    	$isFolderOnly = ($script:skipRenaming -or ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder)))
                         if ($isFolderOnly) {
                             # Folder-only move: show the filename without arrow
                             Write-Host "   $($rename.File.Name)"
                         } else {
                             # Actual rename (name changes)
-                            Write-Host "   $($rename.File.Name) -> " -NoNewline
+                            Write-Host "   " -NoNewline
+                            if ($rename.HasDiscrepancy) {
+                            	$null = Write-FilenameWithMismatchHighlight $rename.File.Name $rename.DiscrepancyDetails
+                            } else {
+                            	Write-Label "$($rename.File.Name)" -NoNewline
+                            }
+                            Write-Warning " -> " -NoNewline
                             Write-Success "$($rename.NewName)"
                         }
                     }
@@ -2690,18 +2945,31 @@ function Show-FinalSummaryAndConfirm($report, $organisePlex = $false, $moveDupli
             } else {
                 # Show folder-style list for consistency (non-Plex -> current directory)
                 Write-Info "[FOLDER] ./"
-                foreach ($rename in ($renamesOnly + $folderOnlyMoves)) {
-					$isFolderOnlyToRoot = ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne $rootPath)
+				# Sort non-Plex items by series code and episode number
+				$sortedRootItems = @($renamesOnly + $folderOnlyMoves) |
+					Sort-Object {
+						if ($_.Episode -and $_.Episode.SeriesEpisode) { $_.Episode.SeriesEpisode } else { 's99e99' }
+					}, {
+						if ($_.Episode -and $_.Episode.Number) { [int]$_.Episode.Number } else { [int]::MaxValue }
+					}, {
+						$_.File.Name
+					}
+				foreach ($rename in $sortedRootItems) {
+					$isFolderOnlyToRoot = ($script:skipRenaming -or ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne $rootPath))
 					if ($isFolderOnlyToRoot) {
 						Write-Host "   " -NoNewline
 						Write-Primary "$($rename.File.Name)"
 					} else {
 						Write-Host "   " -NoNewline
-						Write-Label "$($rename.File.Name)" -NoNewline
+						if ($rename.HasDiscrepancy) {
+							$null = Write-FilenameWithMismatchHighlight $rename.File.Name $rename.DiscrepancyDetails
+						} else {
+							Write-Label "$($rename.File.Name)" -NoNewline
+						}
 						Write-Warning " -> " -NoNewline
 						Write-Success "$($rename.NewName)"
 					}
-                }
+				}
                 Write-Host ""
             }
         }
@@ -2803,7 +3071,7 @@ function Show-FinalSummaryAndConfirm($report, $organisePlex = $false, $moveDupli
 }
 
 # Review discrepancies individually
-function Review-DiscrepanciesIndividually($report, $isGuidedProcess = $false, $namingFormat = 3) {
+function Review-DiscrepanciesIndividually($report, $isGuidedProcess = $false, $namingFormat = 1) {
     Clear-Host
     Write-Info "=== REVIEWING DISCREPANCIES INDIVIDUALLY ==="
     Write-Host ""
@@ -2975,7 +3243,7 @@ function Review-DiscrepanciesIndividually($report, $isGuidedProcess = $false, $n
 }
 
 # Verify library functionality
-function Verify-Library($namingFormat = 3) {
+function Verify-Library($namingFormat = 1) {
     Write-Info "=== LIBRARY VERIFICATION ==="
     Write-Host ""
     if ($script:seriesNameDisplay) {
@@ -2989,7 +3257,7 @@ function Verify-Library($namingFormat = 3) {
     $matchingPreference = Get-MatchingPreference
     
     # Generate analysis report
-    Write-Info "Analysing your library..."
+    Write-Info "Analysing your library... this may take a while..."
     $report = Generate-FileAnalysisReport $matchingPreference $namingFormat
     
     # Load episode data for missing episode analysis
