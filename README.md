@@ -1,6 +1,6 @@
 # Episode Organiser
 
-Organise your series video files into Plex-friendly folders and names.
+Organise your series video files into Plex-friendly folders (optional) and names.
 
 _Originally created to help cleanup and organise the brilliant [Thomas and Friends - The Complete Series (UK - HD) archive from archive.org](https://archive.org/details/thomas-and-friends-the-complete-series-uk)_
 
@@ -8,9 +8,18 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 - [Download the latest release ZIP for this tool.](https://github.com/92jackson/episode-organiser/releases)
 - Extract the ZIP into the same folder where your series video files are stored.
-- Put the series CSV file in that same folder.
+- Put the series CSV file in that same folder (if you have one, if not, use the optiion to generate one).
 - Double‑click `episode_organiser.ps1` to start.
 - Follow the on‑screen prompts. No changes are made until you confirm.
+
+### Command‑line flags
+
+- Start in a specific directory (overrides last used):
+
+  ```powershell
+  # Start in a target folder and preload a CSV
+  powershell -ExecutionPolicy Bypass -File .\episode_organiser.ps1 -StartDir "C:\Downloads\" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
+  ```
 
 ### What is the series CSV?
 
@@ -21,8 +30,18 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 ### If the script says no CSV was found
 
-- It searches both this folder and `episode_datasheets`, then shows options to Retry or Exit.
-- Add your CSV file to either location, then choose Retry.
+- It searches the current folder, the script folder, and `episode_datasheets` next to the script.
+- Place your CSV in any of those locations, then choose Retry.
+
+### Generate a CSV via TMDB scrape
+
+- Use `episode_datasheets\episode_scraper.ps1` to create a series CSV from TMDB.
+- Output is saved as `episode_datasheets\series_name_(year).csv`.
+
+  ```powershell
+  # Scrape TMDB and auto‑confirm; then return to organiser
+  powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps1 -Query "Thomas & Friends" -YearFilter 1984 -AutoConfirm -ReturnToOrganiserOnComplete
+  ```
 
 ## What it does
 

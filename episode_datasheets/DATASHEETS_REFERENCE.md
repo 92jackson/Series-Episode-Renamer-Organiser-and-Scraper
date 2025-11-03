@@ -31,7 +31,7 @@ This folder contains CSV episode data used by Episode Organiser.
 
 - Titles may include characters illegal on Windows (e.g. `?:<>"/\|*:`).
 - During renaming, these are automatically sanitized:
-  - `:` becomes ` - `, `/` and `\` become `-`.
+  - `:` becomes `-`, `/` and `\` become `-`.
   - `?`, `*`, `<`, `>`, `"` are removed.
   - Excess spaces are collapsed and trimmed.
 - You do not need to manually edit titles in the CSV to remove these.
@@ -48,6 +48,7 @@ Row:
 
 ```
 "013","s01e13","Percy Helps Out","2006-10-02","Jack & Jet Pack - Percy Helps Out"
+"528.5","m14","Big World! Big Adventures!","2018-11-12"
 ```
 
-- Season mapping: episodes go to `Season N` from `sXX`, films/specials go to `Season 0`.
+- Season mapping: episodes go to `Season N` from `sXX`, movies go to `Movies/Movie Name (Year)/`.

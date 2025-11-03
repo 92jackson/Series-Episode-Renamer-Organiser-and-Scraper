@@ -1,6 +1,39 @@
-# Episode Organiser
-# https://github.com/92jackson/episode-organiser
-# v1.0.1
+<#
+Repo:		 https://github.com/92jackson/episode-organiser
+Ver:		 1.1.0
+Support:	 https://discord.gg/e3eXGTJbjx
+
+	Episode Organiser for Plex-style TV series management
+
+	- Organises episodes into `Series/Season N` folders and moves unknown/duplicates to cleanup
+	- Renames files using CSV datasheets
+	- Supports quick-run and guided workflows with preview and confirmation
+	- Handles subtitles/thumbnails (sidecars): renames/moves in sync with videos
+	- Maintains restore points to undo last operation
+
+	Usage:
+	& .\episode_organiser.ps1 -StartDir ".\test_series\Thomas & Friends (1984)\Season 1" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
+	& .\episode_organiser.ps1 -StartDir "E:\Media\Shows\Your Series\Season 1" -LoadCsvPath "E:\path\to\datasheet.csv"
+	& .\episode_organiser.ps1
+
+	Parameters:
+	-StartDir		Optional. Root working folder; relative or absolute.
+	-LoadCsvPath	Optional. Path to datasheet CSV; relative or absolute.
+
+	CSV schema:
+	"ep_no","series_ep_code","title","air_date"
+
+	Notes:
+	- Cleanup folders: `cleanup\duplicates\` and `cleanup\unknown\`
+	- Restore points: `cleanup\restore_points\`, one `.jsonl` per operation
+	- Sidecars moved/renamed with videos; thumbnails use `-thumb` style by default
+#>
+
+[CmdletBinding()]
+param(
+	[string]	$LoadCsvPath,
+	[string]	$StartDir
+)
 
 # Global variables
 $cleanupFolder = "cleanup"
@@ -18,7 +51,8 @@ $script:episodeCodeRegex = [regex]'(?i)s(\d{2})\s*(?:e|ep)\s*(\d{2})'
 $script:decimalNumberRegex = [regex]'^\d+\.\d+$'
 $script:formatChoiceRegex = [regex]'^(1[0-3]|[1-9])$'
 $script:seriesCodeRegex = [regex]'^s(\d+)e\d+$'
-$script:filmCodeRegex = [regex]'^s00e\d+$'
+$script:specialCodeRegex = [regex]'^s00e\d+$'
+$script:movieCodeRegex = [regex]'^m\d{2}$'
 
 $script:suppressEpisodeNumberMismatch = $false
 
@@ -124,16 +158,100 @@ function Parse-SeriesNameFromFilename($csvFilename) {
 	return $seriesName
 }
 
+function Run-EpisodeScraperWizard {
+	Clear-Host
+	Write-Success "=== CREATE NEW CSV FROM TMDB ==="
+	Write-Host ""
+	Write-Info "Enter a TV series query (supports 'y:YYYY' inline year)."
+	Write-Alternative "Examples: Squid Game | Thomas & Friends y:1984"
+	Write-Host ""
+	$Query = Read-Host "Query"
+	if ([string]::IsNullOrWhiteSpace($Query)) {
+		Write-Warning "Query cannot be empty. Returning to CSV selection."
+		return
+	}
+	Write-Host ""
+	Write-Info "Optional: Year filter if query lacks y:YYYY"
+	$YearFilter = Read-Host "Year (leave blank to skip)"
+	Write-Host ""
+	# Enforce non-optional behaviour
+	Write-Label "Auto-confirm: " -NoNewline
+	Write-Success "ON" -NoNewline
+	Write-Host " ":
+	Write-Label "Return to organiser: " -NoNewline
+	Write-Success "ON"
+	Write-Host ""
+	try {
+		$root = (Get-Location).Path
+		$datasheetsDir = Join-Path -Path $root -ChildPath 'episode_datasheets'
+		$scraperPath = Join-Path -Path $datasheetsDir -ChildPath 'episode_scraper.ps1'
+		if (-not (Test-Path -LiteralPath $scraperPath)) {
+			throw "Scraper not found at $scraperPath"
+		}
+		Write-Info "Launching scraper..."
+		# Invoke with enforced switches
+		if (-not [string]::IsNullOrWhiteSpace($YearFilter)) {
+			& $scraperPath -Query $Query -YearFilter $YearFilter -AutoConfirm -ReturnToOrganiserOnComplete
+		} else {
+			& $scraperPath -Query $Query -AutoConfirm -ReturnToOrganiserOnComplete
+		}
+		Write-Host ""
+		Write-Success "Returning to CSV selection..."
+		Start-Sleep -Milliseconds 300
+	}
+	catch {
+		Write-Error "Failed to run scraper: $($_.Exception.Message)"
+		Write-Warning "Returning to CSV selection."
+	}
+}
+
 # Detect CSVs, prompt if multiple, and set global series context
 function Initialise-SeriesContext {
+	param(
+		[switch]	$ForceSelection
+	)
+	# Fast-path: explicit CSV provided via -LoadCsvPath (unless forced to prompt)
+	if (-not $ForceSelection -and $LoadCsvPath) {
+        $resolved = [System.IO.Path]::GetFullPath($LoadCsvPath)
+        if (-not (Test-Path -LiteralPath $resolved)) {
+            Write-Error "Specified CSV not found: $resolved"
+        } else {
+            $selected = Get-Item -LiteralPath $resolved
+            # Set global context immediately
+            $script:episodeDataFile = $selected.FullName
+            $script:seriesNameDisplay = Parse-SeriesNameFromFilename $selected.Name
+            if (-not $script:seriesNameDisplay) { $script:seriesNameDisplay = "Series" }
+            $script:seriesRootFolderName = Sanitize-PathSegment $script:seriesNameDisplay
+            $script:cleanSeries = ($script:seriesNameDisplay -replace '\s+', '.' -replace '[^\w&.-]', '')
+            $script:cleanSeriesAnd = ((($script:seriesNameDisplay -replace '&', 'and')) -replace '\s+', '.' -replace '[^\w.-]', '')
+            Clear-Host
+            return
+        }
+    }
 	# Find CSV files in current directory (with retry/exit when none found)
 	while ($true) {
-		# Look for CSVs in current folder and optional 'episode_datasheets' subfolder
+		# Look for CSVs in multiple locations:
+		# - Current working directory (CWD)
+		# - Script directory (next to episode_organiser.ps1)
+		# - 'episode_datasheets' inside CWD and inside script directory
 		$csvFiles = @()
-		$csvFiles += Get-ChildItem -File -Filter *.csv -ErrorAction SilentlyContinue
-		$datasheetsDir = Join-Path -Path (Get-Location).Path -ChildPath 'episode_datasheets'
-		if (Test-Path $datasheetsDir) {
-			$csvFiles += Get-ChildItem -File -Filter *.csv -Path $datasheetsDir -ErrorAction SilentlyContinue
+		$cwd = (Get-Location).Path
+		$scriptDir = $PSScriptRoot
+		# CWD
+		$csvFiles += Get-ChildItem -File -Filter *.csv -Path $cwd -ErrorAction SilentlyContinue
+		# Script directory
+		if (Test-Path -LiteralPath $scriptDir) {
+			$csvFiles += Get-ChildItem -File -Filter *.csv -Path $scriptDir -ErrorAction SilentlyContinue
+		}
+		# episode_datasheets in CWD
+		$datasheetsCwd = Join-Path -Path $cwd -ChildPath 'episode_datasheets'
+		if (Test-Path -LiteralPath $datasheetsCwd) {
+			$csvFiles += Get-ChildItem -File -Filter *.csv -Path $datasheetsCwd -ErrorAction SilentlyContinue
+		}
+		# episode_datasheets next to script
+		$datasheetsScript = Join-Path -Path $scriptDir -ChildPath 'episode_datasheets'
+		if (Test-Path -LiteralPath $datasheetsScript) {
+			$csvFiles += Get-ChildItem -File -Filter *.csv -Path $datasheetsScript -ErrorAction SilentlyContinue
 		}
 		# Sort and remove exact duplicates by full path
 		$csvFiles = $csvFiles | Sort-Object FullName -Unique
@@ -141,29 +259,45 @@ function Initialise-SeriesContext {
 			Write-Host ""
 			Write-Highlight "=== EPISODE ORGANISER ==="
 			Write-Host ""
-			Write-Error "No .csv episode data files found in this folder or in 'episode_datasheets'."
+			Write-Info "This organiser helps rename and sort your TV episodes into tidy folders."
+			Write-Alternative "It uses an episode list (.csv) to match your videos and name them correctly."
+			Write-Error "No episode list (.csv) was found in the current folder, next to the script, or in 'episode_datasheets' next to the script."
 			Write-Host ""
-			Write-Info "To continue, add an episode data CSV to this folder:"
-			Write-Host "  Location: " -NoNewline; Write-Primary (Get-Location).Path
+			Write-Info "Add your episode list here:"
+			Write-Host "  Current folder: " -NoNewline; Write-Primary $cwd
+			Write-Host "  Script folder:  " -NoNewline; Write-Primary $scriptDir
 			Write-Host ""
-			Write-Info "The CSV should contain these columns:"
+			Write-Info "Expected columns:"
 			Write-Primary "`"ep_no`"`,`"series_ep_code`"`,`"title`"`,`"air_date`""
 			Write-Host ""
-			Write-Info "Name the file to match the series (e.g., " -NoNewline
+			Write-Info "Name the file to match your series (e.g., " -NoNewline
 			Write-Primary "thomas_&_friends_(1984).csv" -NoNewline
 			Write-Info ")."
-			Write-Info "The filename sets the series name used throughout."
+			Write-Info "We use the filename as your series name."
 			Write-Host ""
-			Write-Alternative "Options: [R]etry scan, [E]xit script"
+			Write-Info "Don't see your series listed? Press [C] to download the episode list."
+			Write-Host ""
+			Write-Success ">>> Create new CSV (TMDB)"
+			Write-Label "We'll fetch the episode list for your show and come back here"
+			Write-Host ""
+			Write-Info "[OPTIONS]:"
+			Write-Warning "  [C] " -NoNewline; Write-Primary "Create new CSV (TMDB)"
+			Write-Warning "  [R] " -NoNewline; Write-Primary "Retry scan"
+			Write-Warning "  [Q] " -NoNewline; Write-Primary "Quit"
 			Write-Host ""
 			do {
-				$choice = Read-Host "Choose option (R/E)"
-				$valid = $choice -match '^[RrEe]$'
-				if (-not $valid) { Write-Warning "Please enter 'R' to retry or 'E' to exit" }
+				$choice = Read-Host "Choose option (C/R/Q)"
+				$valid = $choice -match '^[RrCcQq]$'
+				if (-not $valid) { Write-Warning "Please enter 'R' to retry, 'C' to create, or 'Q' to quit" }
 			} while (-not $valid)
-			if ($choice -match '^[Ee]$') {
+			if ($choice -match '^[Qq]$') {
 				Clear-Host
 				exit 1
+			}
+			if ($choice -match '^[Cc]$') {
+				Run-EpisodeScraperWizard
+				Clear-Host
+				continue
 			}
 			Clear-Host
 			# Loop and rescan
@@ -178,14 +312,15 @@ function Initialise-SeriesContext {
 		Write-Host ""
 		Write-Highlight "=== EPISODE ORGANISER ==="
 		Write-Host ""
-		Write-Info "You are selecting the episode data file (.csv)."
-		Write-Alternative "A CSV is a plain text spreadsheet (Comma-Separated Values)."
-        Write-Alternative "It should contain episode numbers, episode codes, titles, and dates used for matching."
-        Write-Info "The filename will be used to set the series name."
+		Write-Info "This organiser helps rename and sort your TV episodes into tidy folders."
+		Write-Alternative "First, choose the episode list for your show (the .csv below)."
+		Write-Alternative "We'll use it to match your videos and name them correctly."
         Write-Host ""
         Write-Info "Expected columns:"
-        Write-Primary "`"ep_no`",`"series_ep_code`",`"title`",`"air_date`""
-        Write-Host ""
+		Write-Primary "`"ep_no`",`"series_ep_code`",`"title`",`"air_date`""
+		Write-Host ""
+		Write-Info "Don't see your series listed? Press [C] to download the episode list."
+		Write-Host ""
 		Write-Info "Multiple .csv files detected (paths shown for clarity):"
 		# Build selection items with relative paths to avoid confusion across folders
 		$selectionItems = @()
@@ -201,15 +336,40 @@ function Initialise-SeriesContext {
 		}
 		for ($i = 0; $i -lt $selectionItems.Count; $i++) {
 			$index = $i + 1
+			$disp = $selectionItems[$i].Display
+			$dirPart = Split-Path -Path $disp -Parent
+			$base = [System.IO.Path]::GetFileNameWithoutExtension($disp)
 			Write-Info " $index. " -NoNewline
-			Write-Primary $selectionItems[$i].Display
+			if ($dirPart) {
+				Write-Label "$dirPart\" -NoNewline
+			}
+			Write-Success $base
 		}
+		$maxIndex = $selectionItems.Count
+		Write-Host ""
+		Write-Info "[C] " -NoNewline
+		Write-Success ">>> Create new CSV (TMDB)" -NoNewline
+		Write-Label "  (build datasheet via TMDB)"
+		Write-Info "[Q] " -NoNewline
+		Write-Primary "Quit"
 		Write-Host ""
 		do {
-			$choice = Read-Host "Choose a CSV (1-$($selectionItems.Count))"
-			$valid = $choice -match "^[1-$($selectionItems.Count)]$"
-			if (-not $valid) { Write-Warning "Please enter a number between 1 and $($selectionItems.Count)" }
+			$choice = Read-Host "Choose an option (1-$maxIndex or C/Q)"
+			$validNum = $choice -match '^\d+$' -and ([int]$choice -ge 1) -and ([int]$choice -le $maxIndex)
+			$validCreate = $choice -match '^[Cc]$'
+			$validQuit = $choice -match '^[Qq]$'
+			$valid = $validNum -or $validCreate -or $validQuit
+			if (-not $valid) { Write-Warning "Enter a number 1-$maxIndex, or 'C' to create, or 'Q' to quit" }
 		} while (-not $valid)
+		if ($choice -match '^[Cc]$') {
+			Run-EpisodeScraperWizard
+			Clear-Host
+			continue
+		}
+		if ($choice -match '^[Qq]$') {
+			Clear-Host
+			exit 1
+		}
 		$selected = $selectionItems[[int]$choice - 1].File
 	}
 
@@ -221,7 +381,7 @@ function Initialise-SeriesContext {
 		$script:seriesNameDisplay = "Series"
 	}
 	# Root folder name for Plex-like organisation
-	$script:seriesRootFolderName = $script:seriesNameDisplay
+	$script:seriesRootFolderName = Sanitize-PathSegment $script:seriesNameDisplay
 	# Compute dot-notation series variants used in some formats
 	$script:cleanSeries = ($script:seriesNameDisplay -replace '\s+', '.' -replace '[^\w&.-]', '')
 	$script:cleanSeriesAnd = ((($script:seriesNameDisplay -replace '&', 'and')) -replace '\s+', '.' -replace '[^\w.-]', '')
@@ -360,27 +520,33 @@ function Load-EpisodeData {
         return $null
     }
     
-    $rawEpisodes = Import-Csv $episodeDataFile
+	# Use literal path and halt on parsing errors
+	$rawEpisodes = Import-Csv -LiteralPath $episodeDataFile -ErrorAction Stop
     
     # Convert CSV data to expected format
     $episodes = @()
     foreach ($rawEpisode in $rawEpisodes) {
-        $episode = [PSCustomObject]@{
-            Number = $rawEpisode.ep_no
-            Title = $rawEpisode.title
-            SeriesEpisode = $rawEpisode.series_ep_code
-            AirDate = $rawEpisode.air_date
-        }
+		# Sanitize string fields from CSV to remove control chars and trim
+		$epNo = if ($rawEpisode.ep_no) { ($rawEpisode.ep_no.ToString().Trim()) } else { $null }
+		$title = Sanitize-TextData $rawEpisode.title
+		$seriesCode = Sanitize-TextData $rawEpisode.series_ep_code
+		$airDate = Sanitize-TextData $rawEpisode.air_date
+		$episode = [PSCustomObject]@{
+			Number = $epNo
+			Title = $title
+			SeriesEpisode = $seriesCode
+			AirDate = $airDate
+		}
         # Collect optional alternate titles from various common columns
         $altTitles = @()
-        if ($rawEpisode.alt_title) { $altTitles += $rawEpisode.alt_title }
+        if ($rawEpisode.alt_title) { $altTitles += (Sanitize-TextData $rawEpisode.alt_title) }
         if ($rawEpisode.alt_titles) {
             if ($rawEpisode.alt_titles -is [string] -and $rawEpisode.alt_titles.Trim()) {
-                $altTitles += ($rawEpisode.alt_titles -split ';')
+                $altTitles += (($rawEpisode.alt_titles -split ';') | ForEach-Object { Sanitize-TextData $_ })
             }
         }
-        if ($rawEpisode.aka) { $altTitles += $rawEpisode.aka }
-        if ($rawEpisode.alternate_title) { $altTitles += $rawEpisode.alternate_title }
+        if ($rawEpisode.aka) { $altTitles += (Sanitize-TextData $rawEpisode.aka) }
+        if ($rawEpisode.alternate_title) { $altTitles += (Sanitize-TextData $rawEpisode.alternate_title) }
         # Attach AltTitles property for later lookup building
         Add-Member -InputObject $episode -MemberType NoteProperty -Name AltTitles -Value $altTitles
         $episodes += $episode
@@ -421,21 +587,94 @@ function Load-EpisodeData {
 
 # Initialise directories
 function Initialise-Directories {
-    if (-not (Test-Path $duplicatesFolder)) {
-        New-Item -ItemType Directory -Path $duplicatesFolder | Out-Null
-        Write-Success "Created duplicates folder: $duplicatesFolder"
-    }
-    
-    if (-not (Test-Path $unknownFolder)) {
-        New-Item -ItemType Directory -Path $unknownFolder | Out-Null
-        Write-Success "Created unknown folder: $unknownFolder"
-    }
+	$root = (Get-Location).Path
+	$dupFull = [System.IO.Path]::GetFullPath((Join-Path $root $duplicatesFolder))
+	$unkFull = [System.IO.Path]::GetFullPath((Join-Path $root $unknownFolder))
+	if (-not (Test-Path -LiteralPath $dupFull)) {
+		Ensure-FolderExists -path $duplicatesFolder
+		Write-Success "Created duplicates folder: $duplicatesFolder"
+	}
+	
+	if (-not (Test-Path -LiteralPath $unkFull)) {
+		Ensure-FolderExists -path $unknownFolder
+		Write-Success "Created unknown folder: $unknownFolder"
+	}
+}
+
+# Assert that a path resolves under the current working directory (root)
+function Assert-PathUnderRoot([string]	$path) {
+	$root = (Get-Location).Path
+	$rootFull = [System.IO.Path]::GetFullPath($root)
+	$destFull = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
+	# Ensure trailing separator when doing prefix compare to avoid false positives
+	$rootPrefix = if ($rootFull.EndsWith('\')) { $rootFull } else { "$rootFull\" }
+	if ((-not $destFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) -and ($destFull -ne $rootFull)) {
+		throw "Refusing to operate outside root: $destFull (root: $rootFull)"
+	}
+}
+
+# Helper: boolean check if a path is under current root
+function Is-PathUnderRoot([string]	$path) {
+	$root = (Get-Location).Path
+	$rootFull = [System.IO.Path]::GetFullPath($root)
+	$destFull = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
+	$rootPrefix = if ($rootFull.EndsWith('\')) { $rootFull } else { "$rootFull\" }
+	return (($destFull -eq $rootFull) -or $destFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))
+}
+
+# Detect reserved Windows device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
+function Is-ReservedWindowsName([string]	$name) {
+	if ([string]::IsNullOrEmpty($name)) { return $false }
+	$upper = $name.Trim().ToUpper()
+	$reserved = @("CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9","LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9")
+	return ($reserved -contains $upper)
+}
+
+# Sanitize a single path segment (no separators), clamp length, and avoid reserved names
+function Sanitize-PathSegment([string]	$segment) {
+	if ($null -eq $segment) { return "Series" }
+	$clean = $segment -replace '[\x00-\x1F\x7F]', ''
+	$clean = $clean -replace ':', ' - '
+	$clean = $clean -replace '[\\/]+', '-'
+	$clean = $clean -replace '\|', '-'
+	$clean = $clean -replace '[\?\*<>"]', ''
+	$clean = $clean -replace '\s{2,}', ' '
+	$clean = $clean.Trim()
+	$clean = $clean -replace '^[.\s]+', ''
+	$clean = $clean -replace '[.\s]+$', ''
+	if ($clean.Length -gt 100) { $clean = $clean.Substring(0, 100) }
+	if (Is-ReservedWindowsName $clean) { $clean = "$clean-" }
+	return $clean
+}
+
+# Sanitize general text data (CSV fields): remove control chars and trim
+function Sanitize-TextData([string]	$text) {
+	if ($null -eq $text) { return "" }
+	$text = ($text -as [string])
+	$text = $text -replace '[\x00-\x1F\x7F]', ''
+	return $text.Trim()
+}
+
+# Sanitize a relative path (preserve hierarchy by sanitizing each segment)
+function Sanitize-RelativePath([string]	$path) {
+	if ([string]::IsNullOrWhiteSpace($path)) { return "" }
+	$segments = ($path -split '[\\/]+') | Where-Object { $_ -and $_.Trim().Length -gt 0 }
+	if ($segments.Count -eq 0) { return "" }
+	$sanitizedFirst = Sanitize-PathSegment ($segments[0])
+	$rebuilt = $sanitizedFirst
+	for ($i = 1; $i -lt $segments.Count; $i++) {
+		$rebuilt = Join-Path $rebuilt (Sanitize-PathSegment ($segments[$i]))
+	}
+	return $rebuilt
 }
 
 # Ensure a folder exists only when needed
 function Ensure-FolderExists($path) {
-	$fullTarget = [System.IO.Path]::GetFullPath($path)
-	if (-not (Test-Path $fullTarget)) {
+	$root = (Get-Location).Path
+	$rootFull = [System.IO.Path]::GetFullPath($root)
+	$fullTarget = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
+	Assert-PathUnderRoot $fullTarget
+	if (-not (Test-Path -LiteralPath $fullTarget)) {
 		# Create nested directories safely without migrating any existing folders
 		[System.IO.Directory]::CreateDirectory($fullTarget) | Out-Null
 		# If a restore point is active, record directory creation
@@ -708,7 +947,7 @@ function Cleanup-UnrecognisedFiles {
 		Write-Host ""
 		Write-Info "Empty folders to be deleted:"
 		# Show deepest folders first, parent last
-		$sortedPredicted = $predicted.ToArray() | Sort-Object { ($_.Substring($rootFull.Length).TrimStart('\\') -split '\\').Length } -Descending
+		$sortedPredicted = $predicted | Sort-Object { ($_.Substring($rootFull.Length).TrimStart('\\') -split '\\').Length } -Descending
 		foreach ($dirPath in $sortedPredicted) {
 			$pretty = ($dirPath.Substring($rootFull.Length).TrimStart('\\') -replace '\\','/') + "/"
 			Write-Error "[FOLDER] $pretty"
@@ -742,10 +981,12 @@ function Cleanup-UnrecognisedFiles {
 			$rel = if ($dirFullFile -eq $rootFull) { "" } else { $dirFullFile.Substring($rootFull.Length).TrimStart('\\') }
 			$destDir = if ([string]::IsNullOrEmpty($rel)) { $unknownFolder } else { Join-Path $unknownFolder $rel }
 			Ensure-FolderExists $destDir
+			Assert-PathUnderRoot -Path $destDir
 			$destPath = Join-Path $destDir $f.Name
 			# Record move for undo
 			Record-RestoreOp -type "move" -from $f.FullName -to $destPath
-			Move-Item -LiteralPath $f.FullName -Destination $destDir -Force
+			Assert-PathUnderRoot -Path $destPath
+			Move-Item -LiteralPath $f.FullName -Destination $destDir -Force -ErrorAction Stop
 			$relPretty = if ([string]::IsNullOrEmpty($rel)) { "" } else { ($rel -replace '\\','/') + "/" }
 			Write-Success "Moved: $($f.Name) -> cleanup/unknown/$relPretty"
 		}
@@ -835,6 +1076,7 @@ function RenameAndMove-Sidecars {
 	if (-not $sidecars -or $sidecars.Count -eq 0) { return }
 
 	Ensure-FolderExists -path $destDir
+	Assert-PathUnderRoot -Path $destDir
 
 	foreach ($f in $sidecars) {
 		$ext = $f.Extension.ToLower()
@@ -864,7 +1106,8 @@ function RenameAndMove-Sidecars {
 
 		# Journal sidecar rename+move
 		Record-RestoreOp -type "move" -from $src -to $dest
-		Move-Item -LiteralPath $src -Destination $dest -Force
+		Assert-PathUnderRoot -Path $dest
+		Move-Item -LiteralPath $src -Destination $dest -Force -ErrorAction Stop
 		Write-Host $message
 	}
 }
@@ -880,14 +1123,16 @@ function Move-AssociatedSidecars {
 	if (-not $sidecars -or $sidecars.Count -eq 0) { return }
 
 	Ensure-FolderExists -path $DestinationDir
+	Assert-PathUnderRoot $DestinationDir
 	foreach ($f in $sidecars) {
 		try {
 			$dest = Join-Path $DestinationDir $f.Name
 			# Journal sidecar move
 			Record-RestoreOp -type "move" -from $f.FullName -to $dest
-			Move-Item -LiteralPath $f.FullName -Destination $dest -Force
+			Assert-PathUnderRoot $dest
+			Move-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
 			$root = (Get-Location).Path
-			$destFull = [System.IO.Path]::GetFullPath($DestinationDir)
+			$destFull = if ([System.IO.Path]::IsPathRooted($DestinationDir)) { [System.IO.Path]::GetFullPath($DestinationDir) } else { [System.IO.Path]::GetFullPath((Join-Path $root $DestinationDir)) }
 			$rootFull = [System.IO.Path]::GetFullPath($root)
 			if ($destFull -eq $rootFull) {
 				$prettyDestFolder = "./"
@@ -1033,6 +1278,12 @@ function Extract-EpisodeCode($filename) {
         $episodeNum = [int]$matches[2]
         return "s{0:D2}e{1:D2}" -f $seriesNum, $episodeNum
     }
+    # Also support movie codes mXX
+    $m = [regex]::Match($filename, '(?i)\bm(\d{2})\b')
+    if ($m.Success) {
+        $mNum = [int]$m.Groups[1].Value
+        return "m{0:D2}" -f $mNum
+    }
     
     # Don't convert decimal numbers to episode codes - only return actual episode codes
     return $null
@@ -1110,28 +1361,282 @@ function Find-RenameConflicts($allRenames) {
 
 # Show main menu
 function Show-MainMenu {
-    Write-Host ""
-    Write-Success "=== EPISODE ORGANISER ==="
-    if ($script:seriesNameDisplay) {
-		Write-Info "Series: " -NoNewline
+	Write-Host ""
+	Write-Success "=== EPISODE ORGANISER ==="
+	# Friendly overview
+	Write-Info "Organises your TV episodes into tidy folders and names."
+	Write-Host ""
+	# Current working folder
+	$root = (Get-Location).Path
+	Write-Info "Folder: " -NoNewline
+	Write-Primary $root
+	Write-Label "  (includes all subfolders)"
+	# Loaded series context
+	if ($script:seriesNameDisplay) {
+		Write-Host ""
+		Write-Info "Series loaded: " -NoNewline
 		Write-Primary $script:seriesNameDisplay
-    }
-    Write-Host ""
-    Write-Info "Please choose an option:"
-    Write-Host ""
-    Write-Info " 1. " -NoNewline
-    Write-Primary "Quick rename and clean-up"
-    Write-Info " 2. " -NoNewline
-    Write-Primary "Guided custom rename and clean-up"
-    Write-Info " 3. " -NoNewline
-    Write-Primary "Verify library"
-    Write-Info " 4. " -NoNewline
-    Write-Primary "Clean up unrecognised files"
-    Write-Info " 5. " -NoNewline
-    Write-Primary "Manage restore points"
-    Write-Info " 6. " -NoNewline
-    Write-Primary "Exit"
-    Write-Host ""
+		if ($script:episodeDataFile) {
+			$csvName = [System.IO.Path]::GetFileName($script:episodeDataFile)
+			Write-Host "  CSV: " -NoNewline; Write-Primary $csvName
+		}
+	}
+	Write-Host ""
+	Write-Info "Please choose an option:"
+	Write-Host ""
+	Write-Info " 1. " -NoNewline
+	Write-Primary "Quick rename and clean-up"
+	Write-Info " 2. " -NoNewline
+	Write-Primary "Guided custom rename and clean-up"
+	Write-Info " 3. " -NoNewline
+	Write-Primary "Verify library"
+	Write-Info " 4. " -NoNewline
+	Write-Primary "Clean up unrecognised files"
+	Write-Host ""
+	Write-Info "[R] " -NoNewline
+	Write-Primary "Manage restore points"
+	Write-Info "[S] " -NoNewline
+	Write-Primary "Return to CSV selection"
+	Write-Info "[W] " -NoNewline
+	Write-Primary "Change working folder"
+	Write-Info "[Q] " -NoNewline
+	Write-Primary "Quit"
+	Write-Host ""
+}
+
+function Change-WorkingFolder {
+	Clear-Host
+	Write-Success "=== CHANGE WORKING FOLDER ==="
+	Write-Host ""
+	$current = (Get-Location).Path
+	# Remember previously selected CSV to reload after change
+	$previousCsv = $script:episodeDataFile
+	Write-Info "Current folder: " -NoNewline; Write-Primary $current
+	Write-Label "  (includes all subfolders)"
+	Write-Host ""
+	Write-Info "Choose how to set the working folder:"
+	Write-Host ""
+	Write-Info " [B] " -NoNewline; Write-Primary "Browse to a folder"
+	Write-Info " [R] " -NoNewline; Write-Primary "Recent folders"
+	Write-Info " [E] " -NoNewline; Write-Primary "Enter a path manually"
+	Write-Info " [M] " -NoNewline; Write-Primary "Back to main menu"
+	Write-Host ""
+	do {
+		$mode = Read-Host "Choose option (B/R/E or M)"
+		$valid = $mode -match '^[BbRrEeMm]$'
+		if (-not $valid) { Write-Warning "Please enter B, R, E, or M" }
+	} while (-not $valid)
+
+	$resolved = $null
+	switch ($mode.ToUpper()) {
+		"B" {
+			# Use an interactive text-based browser to avoid GUI hangs
+			$resolved = Browse-FoldersInteractive $current
+			if (-not $resolved) { return }
+		}
+		"R" {
+			$resolved = Choose-RecentFolder
+			if (-not $resolved) { return }
+		}
+		"E" {
+			$resolved = Enter-ManualPath
+			if (-not $resolved) { return }
+		}
+		"M" { return }
+	}
+
+	Write-Host "Switch working folder to: " -NoNewline; Write-Primary $resolved
+	$confirm = Read-Host "Proceed? (y/N)"
+	if ($confirm -ne 'y' -and $confirm -ne 'Y') {
+		Write-Info "Cancelled. Returning to main menu..."
+		return
+	}
+
+	try {
+		Set-Location -LiteralPath $resolved
+		# Reset caches and series context
+		if (Get-Command Clear-VideoFilesCache -ErrorAction SilentlyContinue) { Clear-VideoFilesCache }
+		$script:episodeDataFile = $null
+		$script:seriesNameDisplay = $null
+		$script:seriesRootFolderName = $null
+		$script:cleanSeries = $null
+		$script:cleanSeriesAnd = $null
+		Save-RecentFolder $resolved
+		Save-CurrentFolder $resolved
+		Write-Host ""
+		Write-Success "Working folder updated."
+		Write-Host ""
+		# If a CSV was previously selected, reload it using the fast path
+		if ($previousCsv) {
+			$script:LoadCsvPath = $previousCsv
+			Initialise-SeriesContext
+		} else {
+			Write-Info "Returning to main menu..."
+		}
+	} catch {
+		Write-Error "Failed to change folder: $($_.Exception.Message)"
+	}
+}
+
+# Helper: config (store recents and current folder in script directory)
+function Get-ConfigFilePath {
+	return (Join-Path $PSScriptRoot "organiser_config.json")
+}
+
+function Load-Config {
+	$cfgPath = Get-ConfigFilePath
+	if (Test-Path -LiteralPath $cfgPath) {
+		try {
+			$raw = Get-Content -LiteralPath $cfgPath -ErrorAction Stop | Out-String
+			$cfg = $raw | ConvertFrom-Json -ErrorAction Stop
+		} catch {
+			$cfg = @{ current_folder = $null; recent_folders = @() }
+		}
+	} else {
+		$cfg = @{ current_folder = $null; recent_folders = @() }
+	}
+	if (-not ($cfg.PSObject.Properties.Name -contains 'current_folder')) { $cfg | Add-Member -NotePropertyName current_folder -NotePropertyValue $null }
+	if (-not ($cfg.PSObject.Properties.Name -contains 'recent_folders')) { $cfg | Add-Member -NotePropertyName recent_folders -NotePropertyValue @() }
+	if ($cfg.recent_folders -isnot [System.Collections.IEnumerable]) { $cfg.recent_folders = @() }
+	$cfg.recent_folders = @($cfg.recent_folders | Where-Object { $_ -and $_.Trim() -ne "" })
+	return $cfg
+}
+
+function Save-Config($cfg) {
+	$cfgPath = Get-ConfigFilePath
+	try {
+		$json = $cfg | ConvertTo-Json -Compress
+		Set-Content -LiteralPath $cfgPath -Value $json -ErrorAction SilentlyContinue
+	} catch {}
+}
+
+function Get-RecentFolders {
+	$cfg = Load-Config
+	return @($cfg.recent_folders)
+}
+
+function Save-RecentFolder([string]	$path) {
+	$cfg = Load-Config
+	$existing = @($cfg.recent_folders)
+	$list = @($path) + ($existing | Where-Object { $_ -ne $path })
+	$cfg.recent_folders = @($list | Select-Object -First 10)
+	Save-Config $cfg
+}
+
+function Save-CurrentFolder([string]	$path) {
+	$cfg = Load-Config
+	$cfg.current_folder = $path
+	Save-Config $cfg
+}
+
+# Helper: GUI folder browser (Windows only)
+function Show-FolderBrowser {
+	$current = (Get-Location).Path
+	try {
+		Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+		$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+		$dlg.Description = "Select the working folder. All subfolders will be processed."
+		$dlg.ShowNewFolderButton = $true
+		$dlg.SelectedPath = $current
+		$result = $dlg.ShowDialog()
+		if ($result -eq [System.Windows.Forms.DialogResult]::OK) { return $dlg.SelectedPath } else { return $null }
+	} catch {
+		Write-Warning "Folder picker unavailable; please enter a path manually."
+		return $null
+	}
+}
+
+# Interactive text-based folder browser (safe in console environments)
+function Browse-FoldersInteractive([string]	$start) {
+	$here = [System.IO.Path]::GetFullPath($start)
+	while ($true) {
+		Clear-Host
+		Write-Success "=== BROWSE FOLDERS ==="
+		Write-Host ""
+		Write-Info "Current: " -NoNewline; Write-Primary $here; Write-Label "  (includes all subfolders)"
+		Write-Host ""
+		$dirs = Get-ChildItem -LiteralPath $here -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 20
+		if ($dirs.Count -eq 0) { Write-Label "No subfolders here." } else { Write-Info "Subfolders:" }
+		$idx = 1
+		foreach ($d in $dirs) { Write-Host "  [$idx] " -NoNewline; Write-Primary $d.Name; $idx++ }
+		Write-Host ""
+		Write-Info "Options:"
+		Write-Host "  [S] " -NoNewline; Write-Primary "Select this folder"
+		Write-Host "  [..] " -NoNewline; Write-Primary "Go to parent"
+		Write-Host "  [E] " -NoNewline; Write-Primary "Enter a path manually"
+		Write-Host "  [C] " -NoNewline; Write-Primary "Cancel"
+		Write-Host ""
+		$choice = Read-Host "Choose number, S, '..', E or C"
+		if ($choice -eq "S" -or $choice -eq "s") { return $here }
+		elseif ($choice -eq "..") { $here = Split-Path -Parent $here }
+		elseif ($choice -eq "E" -or $choice -eq "e") {
+			$manual = Enter-ManualPath
+			if ($manual) { return $manual }
+		}
+		elseif ($choice -match '^[1-9][0-9]*$') {
+			$c = [int]$choice
+			if ($c -ge 1 -and $c -le $dirs.Count) { $here = $dirs[$c-1].FullName }
+		}
+		elseif ($choice -match '^[Cc]$') { return $null }
+		else { Write-Warning "Invalid selection." }
+	}
+}
+
+# Helper: quick-pick subfolders
+function Choose-Subfolder([string]	$base) {
+	$dirs = Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Select-Object -First 15
+	if (-not $dirs -or $dirs.Count -eq 0) {
+		Write-Info "No subfolders found under: " -NoNewline; Write-Primary $base
+		return $null
+	}
+	Write-Info "Subfolders:"
+	$idx = 1
+	foreach ($d in $dirs) {
+		Write-Host "  [$idx] " -NoNewline; Write-Primary $d.FullName
+		$idx++
+	}
+	Write-Host "  [..] Parent folder"
+	$choice = Read-Host "Choose number, '..' for parent, or C to cancel"
+	if ($choice -eq "..") { return (Split-Path -Parent $base) }
+	if ($choice -match '^[1-9][0-9]*$') {
+		$c = [int]$choice
+		if ($c -ge 1 -and $c -le $dirs.Count) { return $dirs[$c-1].FullName }
+	}
+	if ($choice -match '^[Cc]$') { return $null }
+	Write-Warning "Invalid selection."
+	return $null
+}
+
+# Helper: choose from recent folders
+function Choose-RecentFolder {
+	$recent = @(Get-RecentFolders)
+	if (-not $recent -or $recent.Count -eq 0) {
+		Write-Info "No recent folders saved yet."
+		return $null
+	}
+	Write-Info "Recent folders:"
+	$idx = 1
+	foreach ($r in $recent) {
+		Write-Host "  [$idx] " -NoNewline; Write-Primary $r
+		$idx++
+	}
+	$choice = Read-Host "Choose number or C to cancel"
+	if ($choice -match '^[1-9][0-9]*$') {
+		$c = [int]$choice
+		if ($c -ge 1 -and $c -le $recent.Count) { return $recent[$c-1] }
+	}
+	if ($choice -match '^[Cc]$') { return $null }
+	Write-Warning "Invalid selection."
+	return $null
+}
+
+# Helper: manual path entry with validation
+function Enter-ManualPath {
+	$newPath = Read-Host "Enter new folder path"
+	if ([string]::IsNullOrWhiteSpace($newPath)) { Write-Warning "No path entered."; return $null }
+	try { $resolved = [System.IO.Path]::GetFullPath($newPath) } catch { Write-Error "Invalid path: $newPath"; return $null }
+	if (-not (Test-Path -LiteralPath $resolved)) { Write-Error "Folder not found: $resolved"; return $null }
+	return $resolved
 }
 
 # Show matching preferences
@@ -1239,6 +1744,9 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 					$code = Extract-EpisodeCode $file.Name
 					if ($code) {
 						$canonical = $code.ToLower()
+						# Map s00eNN extracted from filename to mNN dataset code for movies
+						$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+						if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
 						if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
 							$ep = $script:episodesBySeriesEpisode[$canonical]
 							$matchKey = Normalise-Text $ep.Title
@@ -1253,6 +1761,9 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 				$code = Extract-EpisodeCode $file.Name
 				if ($code) {
 					$canonical = $code.ToLower()
+					# Map s00eNN extracted from filename to mNN dataset code for movies
+					$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+					if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
 					if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
 						return $script:episodesBySeriesEpisode[$canonical]
 					}
@@ -1264,6 +1775,9 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 			$code = Extract-EpisodeCode $file.Name
 			if ($code) {
 				$canonical = $code.ToLower()
+				# Map s00eNN extracted from filename to mNN dataset code for movies
+				$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+				if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
 				if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
 					return $script:episodesBySeriesEpisode[$canonical]
 				}
@@ -1298,7 +1812,11 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 			if ($extractedTitle) {
 				$code = Extract-EpisodeCode $file.Name
 				if ($code) {
-					$episode = $script:episodesBySeriesEpisode[$code.ToLower()]
+					$canonical = $code.ToLower()
+					# Map s00eNN extracted from filename to mNN dataset code for movies
+					$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+					if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
+					$episode = $script:episodesBySeriesEpisode[$canonical]
 				
 					if ($episode) {
 						$normalisedExtracted = Normalise-Text $extractedTitle
@@ -1409,14 +1927,24 @@ function Show-NamingFormats {
 
 function Sanitize-FileName([string]	$name) {
 	if ([string]::IsNullOrEmpty($name)) { return $name }
+	# Remove control characters and normalize separators/invalid chars
+	$name = $name -replace '[\x00-\x1F\x7F]', ''
 	$name = $name -replace ':', ' - '
 	$name = $name -replace '[\\/]+', '-'
 	$name = $name -replace '\|', '-'
 	$name = $name -replace '[\?\*<>"]', ''
 	$name = $name -replace '\s{2,}', ' '
 	$name = $name.Trim()
-	$name = $name -replace '\s+$', ''
-	return $name
+	# Disallow leading/trailing dots and spaces
+	$name = $name -replace '^[.\s]+', ''
+	$name = $name -replace '[.\s]+$', ''
+	# Clamp basename length and avoid reserved device names
+	$ext = [System.IO.Path]::GetExtension($name)
+	$base = [System.IO.Path]::GetFileNameWithoutExtension($name)
+	if (Is-ReservedWindowsName $base) { $base = "$base-file" }
+	$maxBaseLen = 200
+	if ($base.Length -gt $maxBaseLen) { $base = $base.Substring(0, $maxBaseLen) }
+	return "$base$ext"
 }
 
 function Get-FormattedFilename($episode, $format, $extension) {
@@ -1439,57 +1967,68 @@ function Get-FormattedFilename($episode, $format, $extension) {
     $cleanSeries = if ($script:cleanSeries) { $script:cleanSeries } else { ($seriesDisplay -replace '\s+', '.' -replace '[^\w&.-]', '') }
     $cleanSeriesAnd = if ($script:cleanSeriesAnd) { $script:cleanSeriesAnd } else { ((($seriesDisplay -replace '&', 'and')) -replace '\s+', '.' -replace '[^\w.-]', '') }
     
-	# Handle movies (s00eXX entries) differently
-	if ($episode.SeriesEpisode -and $episode.SeriesEpisode -match $script:filmCodeRegex) {
+	# Graceful handling when episode number is missing: build optional prefixes
+	$numPrefix = if ($episode.Number -and $episode.Number -ne "") { "$(($episode.Number)) - " } else { "" }
+	$numDotPrefix = if ($episode.Number -and $episode.Number -ne "") { "$(($episode.Number)). " } else { "" }
+    
+	# Handle movies (mXX entries) differently
+	if ($episode.SeriesEpisode -and $episode.SeriesEpisode -match $script:movieCodeRegex) {
 		switch ($format) {
 			1 { return (Sanitize-FileName "$seriesDisplay - $($episode.Title)$extension") }
 			2 { return (Sanitize-FileName "$($episode.Title)$extension") }
-			3 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
-			4 { return (Sanitize-FileName "$($episode.Number). $($episode.Title)$extension") }
+			3 { return (Sanitize-FileName "${numPrefix}$($episode.Title)$extension") }
+			4 { return (Sanitize-FileName "${numDotPrefix}$($episode.Title)$extension") }
 			5 { return (Sanitize-FileName "$($episode.Title)$airDateStr$extension") }
-			6 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$airDateStr$extension") }
+			6 { return (Sanitize-FileName "${numPrefix}$($episode.Title)$airDateStr$extension") }
 			7 { return (Sanitize-FileName "$seriesDisplay - $($episode.Title)$airDateStr$extension") }
 			8 { return (Sanitize-FileName "$($episode.Title)$extension") }
 			9 { return (Sanitize-FileName "$($cleanTitle)$extension") }
 			10 { return (Sanitize-FileName "$cleanSeries.$($cleanTitle)$extension") }
 			11 { return (Sanitize-FileName "[$seriesDisplay] - $($episode.Title)$extension") }
 			12 { return (Sanitize-FileName "$cleanSeriesAnd.$($cleanTitle)$extension") }
-			default { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
+			default { return (Sanitize-FileName "${numPrefix}$($episode.Title)$extension") }
 		}
-	} else {
-		# Handle regular episodes
-		$upperSeriesEpisode = if ($episode.SeriesEpisode) { $episode.SeriesEpisode.ToUpper() } else { "" }
-		switch ($format) {
-			1 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
-			2 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$extension") }
-			3 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
-			4 { return (Sanitize-FileName "$($episode.Number). $($episode.SeriesEpisode) - $($episode.Title)$extension") }
-			5 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
-			6 { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$airDateStr$extension") }
-			7 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
-			8 { return (Sanitize-FileName "$($episode.Title)$extension") }
-			9 { return (Sanitize-FileName "$upperSeriesEpisode.$cleanTitle$extension") }
-			10 { return (Sanitize-FileName "$cleanSeries.$upperSeriesEpisode.$cleanTitle$extension") }
-			11 { return (Sanitize-FileName "[$seriesDisplay] - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
-			12 { return (Sanitize-FileName "$cleanSeriesAnd.$($episode.SeriesEpisode).$cleanTitle$extension") }
-			default { return (Sanitize-FileName "$($episode.Number) - $($episode.Title)$extension") }
-		}
+	}
+
+	# Handle all non-movie episodes uniformly (including s00 specials)
+	$upperSeriesEpisode = if ($episode.SeriesEpisode) { $episode.SeriesEpisode.ToUpper() } else { "" }
+	switch ($format) {
+		1 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
+		2 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$extension") }
+		3 { return (Sanitize-FileName "${numPrefix}$($episode.Title)$extension") }
+		4 { return (Sanitize-FileName "${numDotPrefix}$($episode.SeriesEpisode) - $($episode.Title)$extension") }
+		5 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
+		6 { return (Sanitize-FileName "${numPrefix}$($episode.Title)$airDateStr$extension") }
+		7 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$airDateStr$extension") }
+		8 { return (Sanitize-FileName "$($episode.Title)$extension") }
+		9 { return (Sanitize-FileName "$upperSeriesEpisode.$cleanTitle$extension") }
+		10 { return (Sanitize-FileName "$cleanSeries.$upperSeriesEpisode.$cleanTitle$extension") }
+		11 { return (Sanitize-FileName "[$seriesDisplay] - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
+		12 { return (Sanitize-FileName "$cleanSeriesAnd.$($episode.SeriesEpisode).$cleanTitle$extension") }
+		default { return (Sanitize-FileName "${numPrefix}$($episode.Title)$extension") }
 	}
 }
 
 # Get Plex-compatible series folder name from episode data
 function Get-SeriesFolderName($episode) {
-    if ($episode.SeriesEpisode -match $script:filmCodeRegex) {
-        return "$($script:seriesRootFolderName)/Season 0"
-    } else {
-        # Extract series number from SeriesEpisode (e.g., "s01e01" -> "01")
-        if ($episode.SeriesEpisode -match $script:seriesCodeRegex) {
-            $seriesNum = $matches[1]
-            return "$($script:seriesRootFolderName)/Season $([int]$seriesNum)"
-        }
-    }
-    # Fallback for any unexpected format
-    return "$($script:seriesRootFolderName)/Unknown"
+    # Movies: put under Movies/<Title (YYYY)>
+	if ($episode.SeriesEpisode -match $script:movieCodeRegex) {
+		$year = $null
+		if ($episode.AirDate -and $episode.AirDate -ne "") {
+			try { $year = ([DateTime]::Parse($episode.AirDate)).Year } catch { $year = $null }
+		}
+		$seriesNoYear = if ($script:seriesNameDisplay) { ($script:seriesNameDisplay -replace '\s*\(.*\)$','') } else { "Series" }
+		$name = if ($year) { "$seriesNoYear - $($episode.Title) ($year)" } else { "$seriesNoYear - $($episode.Title)" }
+		$folder = Sanitize-FileName $name
+		return "$($script:seriesRootFolderName)/Movies/$folder"
+	}
+	# Extract series number from SeriesEpisode (e.g., "s01e01" -> "01")
+	if ($episode.SeriesEpisode -match $script:seriesCodeRegex) {
+		$seriesNum = $matches[1]
+		return "$($script:seriesRootFolderName)/Season $([int]$seriesNum)"
+	}
+	# Fallback for any unexpected format
+	return "$($script:seriesRootFolderName)/Unknown"
 }
 
 # Generate detailed analysis report for files
@@ -1560,7 +2099,10 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 1) {
 			# Check episode number discrepancy (respect suppression unless matching by episode number)
 			$extractedEpisodeNum = Extract-EpisodeNumber $file.Name $episodeData
 			$shouldSuppressNumMismatch = $script:suppressEpisodeNumberMismatch -and ($matchingPreference -ne 4)
-			if (-not $shouldSuppressNumMismatch -and $extractedEpisodeNum -and $extractedEpisodeNum -ne $matchedEpisode.Number) {
+			# Additional suppression: if the reference episode has no global number, skip mismatch unless matching by number
+			$referenceHasNumber = (-not [string]::IsNullOrWhiteSpace($matchedEpisode.Number))
+			$suppressDueToBlankRef = (-not $referenceHasNumber) -and ($matchingPreference -ne 4)
+			if (-not $shouldSuppressNumMismatch -and -not $suppressDueToBlankRef -and $extractedEpisodeNum -and $extractedEpisodeNum -ne $matchedEpisode.Number) {
 				$hasDiscrepancy = $true
 				$discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Number Mismatch" } else { "Episode Number Mismatch" }
 				$discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
@@ -1570,10 +2112,16 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 1) {
             # Check episode code discrepancy
             $extractedEpisodeCode = Extract-EpisodeCode $file.Name
             if ($extractedEpisodeCode -and $extractedEpisodeCode -ne $matchedEpisode.SeriesEpisode) {
+                # Treat legacy specials code s00eNN in filename as equivalent to mNN in dataset
+                $isLegacySpecial = [regex]::Match($extractedEpisodeCode, '^s00e(\d{2})$')
+                $isMovieRef = [regex]::Match($matchedEpisode.SeriesEpisode, '^m(\d{2})$')
+                $equivalentMovie = ($isLegacySpecial.Success -and $isMovieRef.Success -and ([int]$isLegacySpecial.Groups[1].Value -eq [int]$isMovieRef.Groups[1].Value))
+                if (-not $equivalentMovie) {
                 $hasDiscrepancy = $true
                 $discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Code Mismatch" } else { "Episode Code Mismatch" }
                 $discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
                 $discrepancyDetails += "Extracted Code: '$extractedEpisodeCode' vs Reference Code: '$($matchedEpisode.SeriesEpisode)'"
+                }
             }
             
             $renameInfo = [PSCustomObject]@{
@@ -1859,7 +2407,18 @@ function Show-DetailedReport($report) {
 					Write-Primary "$($group.Name)/ " -NoNewline
 					Write-Label "($($displayItems.Count) files)"
 					foreach ($rename in $sortedItems) {
-						$isFolderOnly = ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder))
+						# Compute canonical preview target for movies
+						$previewTargetName = $rename.NewName
+						if ($rename.Episode -and $rename.Episode.SeriesEpisode -match $script:movieCodeRegex) {
+							$seriesNoYear = if ($script:seriesNameDisplay) { ($script:seriesNameDisplay -replace '\s*\(.*\)$','') } else { "Series" }
+							$year = $null
+							if ($rename.Episode.AirDate -and $rename.Episode.AirDate -ne "") {
+								try { $year = ([DateTime]::Parse($rename.Episode.AirDate)).Year } catch { $year = $null }
+							}
+							$suffix = if ($year) { " ($year)" } else { "" }
+							$previewTargetName = Sanitize-FileName "$seriesNoYear - $($rename.Episode.Title)$suffix$($rename.File.Extension)"
+						}
+						$isFolderOnly = ($rename.File.Name -eq $previewTargetName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder))
 						if ($isFolderOnly) {
 							# Folder-only move: show filename without arrow
 							Write-Host "   " -NoNewline
@@ -1873,12 +2432,11 @@ function Show-DetailedReport($report) {
 							Write-Label "$($rename.File.Name)" -NoNewline
 						}
 						Write-Warning " -> " -NoNewline
-						
 						# Use yellow for discrepancies (predicted matches), green for confirmed matches
 						if ($rename.HasDiscrepancy) {
-							Write-Success "$($rename.NewName)"
+							Write-Success "$previewTargetName"
 						} else {
-							Write-Success "$($rename.NewName)"
+							Write-Success "$previewTargetName"
 						}
 						}
 					}
@@ -2128,6 +2686,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 	# Handle duplicates first (if chosen and present)
 	if ($moveDuplicates -and $report.Duplicates.Count -gt 0) {
 		Ensure-FolderExists $duplicatesFolder
+		Assert-PathUnderRoot $duplicatesFolder
 		foreach ($dup in $report.Duplicates) {
 			# Determine which file to move based on duplicate type
 			if ($dup.ConflictType -eq "Rename Collision") {
@@ -2137,8 +2696,10 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 			}
 
 			# Resolve source and destination paths robustly
+			$rootPath = (Get-Location).Path
 			$srcPath = $moveFile.FullName
-			$dupDestDirFull = [System.IO.Path]::GetFullPath($duplicatesFolder)
+			$dupDestDirFull = [System.IO.Path]::GetFullPath((Join-Path $rootPath $duplicatesFolder))
+			$dupTargetPath = [System.IO.Path]::GetFullPath((Join-Path $dupDestDirFull $moveFile.Name))
 			$srcDirFull = [System.IO.Path]::GetFullPath([System.IO.Path]::GetDirectoryName($srcPath))
 
 			try {
@@ -2154,9 +2715,10 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 					$successCount++
 				}
 				else {
-				# Journal move for restore
-				Record-RestoreOp -type "move" -from $srcPath -to ([System.IO.Path]::Combine($duplicatesFolder, $moveFile.Name))
-				Move-Item -LiteralPath $srcPath -Destination $duplicatesFolder -Force
+				# Journal move for restore (to exact target path)
+				Record-RestoreOp -type "move" -from $srcPath -to $dupTargetPath
+				Assert-PathUnderRoot $dupTargetPath
+				Move-Item -LiteralPath $srcPath -Destination $dupTargetPath -Force -ErrorAction Stop
 					if ($dup.ConflictType -eq "Rename Collision") {
 						Write-Success "Moved duplicate (rename conflict): $($moveFile.Name) -> cleanup/duplicates/"
 					} else {
@@ -2175,13 +2737,18 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 	}
     
     # Handle unmatched files (if chosen and present)
-    if ($moveUnknown -and $report.UnmatchedFiles.Count -gt 0) {
-        Ensure-FolderExists $unknownFolder
+	if ($moveUnknown -and $report.UnmatchedFiles.Count -gt 0) {
+		Ensure-FolderExists $unknownFolder
+		Assert-PathUnderRoot $unknownFolder
         foreach ($file in $report.UnmatchedFiles) {
             try {
                 # Journal move for restore
-                Record-RestoreOp -type "move" -from $file.FullName -to ([System.IO.Path]::Combine($unknownFolder, $file.Name))
-                Move-Item -Path $file.FullName -Destination $unknownFolder -Force
+				$rootPath = (Get-Location).Path
+				$unknownDirFull = [System.IO.Path]::GetFullPath((Join-Path $rootPath $unknownFolder))
+				$unknownTargetPath = [System.IO.Path]::GetFullPath((Join-Path $unknownDirFull $file.Name))
+				Record-RestoreOp -type "move" -from $file.FullName -to $unknownTargetPath
+				Assert-PathUnderRoot $unknownTargetPath
+				Move-Item -LiteralPath $file.FullName -Destination $unknownTargetPath -Force -ErrorAction Stop
                 Write-Success "Moved unmatched: $($file.Name) -> cleanup/unknown/"
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $file.FullName -DestinationDir $unknownFolder
@@ -2196,19 +2763,33 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
     
     # Handle renames with Plex organization (both clean and discrepancies)
     $allRenames = $report.ProposedRenames + $report.Discrepancies
-    # Exclude any items that would be true no-ops
-    $allRenames = @($allRenames | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne $_.SeriesFolder })
+    # Compute absolute target folder for accurate comparisons
+    $rootPath = (Get-Location).Path
+    $allRenames = @($allRenames | ForEach-Object {
+    	$absSeriesFolder = [System.IO.Path]::GetFullPath((Join-Path $rootPath $_.SeriesFolder))
+    	# Attach a computed property for later use
+    	$_.PSObject.Properties.Remove('AbsSeriesFolder') | Out-Null
+    	$_.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('AbsSeriesFolder', $absSeriesFolder)))
+    	$_
+    })
+    # Exclude any items that would be true no-ops (name and folder already match)
+    $allRenames = @($allRenames | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne $_.AbsSeriesFolder })
+    # Filter out items whose source path is outside current root
+    $allRenames = @($allRenames | Where-Object { Is-PathUnderRoot $_.File.FullName })
     if ($allRenames.Count -gt 0) {
         # Group files by series folder for Plex organization
         $groupedRenames = $allRenames | Group-Object SeriesFolder
         
         foreach ($group in $groupedRenames) {
-            $folderName = $group.Name
+            $folderName = Sanitize-RelativePath $group.Name
+            $rootPath = (Get-Location).Path
+            $folderAbsolute = [System.IO.Path]::GetFullPath((Join-Path $rootPath $folderName))
             
             # Create folder if it doesn't exist
-            if (-not (Test-Path $folderName)) {
+            if (-not (Test-Path -LiteralPath $folderAbsolute)) {
                 try {
-                    Ensure-FolderExists $folderName
+                    Assert-PathUnderRoot -Path $folderAbsolute
+                    Ensure-FolderExists $folderAbsolute
                     Write-Success "Created folder: $folderName/"
                 }
                 catch {
@@ -2221,24 +2802,29 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
             foreach ($rename in $group.Group) {
                 try {
 					$originalPath = $rename.File.FullName
-					# Respect skip-renaming when determining the target name
-					$targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
-					$targetPath = Join-Path $folderName $targetName
-					# Skip if target equals current full path (true no-op)
-					$targetFullPath = [System.IO.Path]::GetFullPath($targetPath)
-					if ($targetFullPath -eq $rename.File.FullName) { continue }
+                    # Respect skip-renaming when determining the target name (sanitized)
+                    $targetName = if ($script:skipRenaming) { $rename.File.Name } else { Sanitize-FileName $rename.NewName }
+                    $targetPath = Join-Path $folderName $targetName
+                    $targetDirFull = $folderAbsolute
+                    $targetPathAbs = [System.IO.Path]::GetFullPath((Join-Path $targetDirFull $targetName))
+                    Assert-PathUnderRoot -Path $targetPathAbs
+                    Assert-PathUnderRoot -Path $originalPath
+				# Skip if target equals current full path (true no-op)
+				if ($targetPathAbs -eq $rename.File.FullName) { continue }
 
-                    if (Test-Path $targetPath) {
+                    if (Test-Path -LiteralPath $targetPathAbs) {
                         Write-Warning "Target file already exists: $targetPath"
                         continue
                     }
                     
 				# Respect skip-renaming: keep original filename if set
 				$targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
-				$targetPath = Join-Path $folderName $targetName
-				# Journal move/rename for restore
-				Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
-				Move-Item -Path $rename.File.FullName -Destination $targetPath
+                $targetPath = Join-Path $folderName $targetName
+                $targetPathAbs = [System.IO.Path]::GetFullPath((Join-Path $folderAbsolute $targetName))
+                Assert-PathUnderRoot -Path $targetPathAbs
+                # Journal move/rename for restore
+                Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPathAbs
+                Move-Item -LiteralPath $rename.File.FullName -Destination $targetPathAbs -ErrorAction Stop
 				$didRename = (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName))
 				if ($didRename) {
 					Write-Success "Organised: $($rename.File.Name) -> $folderName/$($rename.NewName)"
@@ -2248,9 +2834,9 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 				# Process sidecars if enabled
 				if ($processSidecars) {
 					if ($script:skipRenaming) {
-						Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderName
+						Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderAbsolute
 					} else {
-						RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
+						RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPathAbs -ThumbStyle 'thumb'
 					}
 				}
 					$successCount++
@@ -2542,6 +3128,7 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
     # Move duplicates first (if chosen and present)
     if ($moveDuplicates -and $report.Duplicates.Count -gt 0) {
         Ensure-FolderExists $duplicatesFolder
+        Assert-PathUnderRoot $duplicatesFolder
         foreach ($dup in $report.Duplicates) {
 			# Determine which file to move based on duplicate type
 			if ($dup.ConflictType -eq "Rename Collision") {
@@ -2553,7 +3140,7 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 			try {
 				# Journal move for restore
 				Record-RestoreOp -type "move" -from $moveFile.FullName -to ([System.IO.Path]::Combine($duplicatesFolder, $moveFile.Name))
-				Move-Item -Path $moveFile.FullName -Destination $duplicatesFolder -Force
+				Move-Item -LiteralPath $moveFile.FullName -Destination $duplicatesFolder -Force -ErrorAction Stop
                 if ($dup.ConflictType -eq "Rename Collision") {
                     Write-Success "Moved duplicate (rename conflict): $($moveFile.Name) -> cleanup/duplicates/"
                 } else {
@@ -2573,11 +3160,12 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
     # Move unmatched files (if chosen and present)
     if ($moveUnknown -and $report.UnmatchedFiles.Count -gt 0) {
         Ensure-FolderExists $unknownFolder
+        Assert-PathUnderRoot $unknownFolder
         foreach ($file in $report.UnmatchedFiles) {
             try {
 				# Journal move for restore
 				Record-RestoreOp -type "move" -from $file.FullName -to ([System.IO.Path]::Combine($unknownFolder, $file.Name))
-                Move-Item -Path $file.FullName -Destination $unknownFolder -Force
+				Move-Item -LiteralPath $file.FullName -Destination $unknownFolder -Force -ErrorAction Stop
                 Write-Success "Moved unmatched: $($file.Name) -> cleanup/unknown/"
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $file.FullName -DestinationDir $unknownFolder
@@ -2603,19 +3191,20 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 
 			# Skip if target equals current full path (true no-op)
 			if ($targetFullPath -eq $rename.File.FullName) { continue }
+			Assert-PathUnderRoot $targetPath
 			
-			if (Test-Path $targetPath) {
-				Write-Warning "Target file already exists: $($targetName)"
-				continue
-			}
+		if (Test-Path -LiteralPath $targetPath) {
+			Write-Warning "Target file already exists: $($targetName)"
+			continue
+		}
 			
 			$currentDir = $rename.File.DirectoryName
 			if ($currentDir -eq $rootDir) {
 				# File is already in root directory
 				if (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName)) {
 					# Rename in place if not skipping renames
-					Record-RestoreOp -type "move" -from $originalPath -to $targetPath
-					Rename-Item -Path $rename.File.FullName -NewName $rename.NewName
+				Record-RestoreOp -type "move" -from $originalPath -to $targetPath
+				Rename-Item -LiteralPath $rename.File.FullName -NewName $rename.NewName -ErrorAction Stop
 					Write-Success "Renamed: $($rename.File.Name) -> $($rename.NewName)"
 					# Process sidecars if enabled
 					if ($processSidecars) {
@@ -2627,9 +3216,10 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 				}
 			} else {
 				# File is in a subdirectory, move it to root and possibly rename
-				# Journal move/rename for restore
-				Record-RestoreOp -type "move" -from $originalPath -to $targetPath
-				Move-Item -Path $rename.File.FullName -Destination $targetPath
+			# Journal move/rename for restore
+		Record-RestoreOp -type "move" -from $originalPath -to $targetPath
+		Assert-PathUnderRoot $targetPath
+		Move-Item -LiteralPath $rename.File.FullName -Destination $targetPath -ErrorAction Stop
 				$didRename = (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName))
 				if ($didRename) {
 					Write-Success "Moved and renamed: $($rename.File.Name) -> ./$($rename.NewName)"
@@ -2673,7 +3263,7 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
             try {
                 # Journal move for restore
                 Record-RestoreOp -type "move" -from $moveFile.FullName -to ([System.IO.Path]::Combine($duplicatesFolder, $moveFile.Name))
-                Move-Item -Path $moveFile.FullName -Destination $duplicatesFolder -Force
+				Move-Item -LiteralPath $moveFile.FullName -Destination $duplicatesFolder -Force -ErrorAction Stop
                 Write-Success "Moved duplicate: $($moveFile.Name) -> cleanup/duplicates/"
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $moveFile.FullName -DestinationDir $duplicatesFolder
@@ -2693,7 +3283,7 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
             try {
                 # Journal move for restore
                 Record-RestoreOp -type "move" -from $file.FullName -to ([System.IO.Path]::Combine($unknownFolder, $file.Name))
-                Move-Item -Path $file.FullName -Destination $unknownFolder -Force
+				Move-Item -LiteralPath $file.FullName -Destination $unknownFolder -Force -ErrorAction Stop
                 Write-Success "Moved unmatched: $($file.Name) -> cleanup/unknown/"
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $file.FullName -DestinationDir $unknownFolder
@@ -2710,11 +3300,12 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
     $groupedRenames = $report.ProposedRenames | Group-Object SeriesFolder
     
     foreach ($group in $groupedRenames) {
-        $folderName = $group.Name
+        $folderName = Sanitize-RelativePath $group.Name
         
         # Create folder if it doesn't exist
-        if (-not (Test-Path $folderName)) {
+        if (-not (Test-Path -LiteralPath $folderName)) {
             try {
+                Assert-PathUnderRoot -Path $folderName
                 Ensure-FolderExists $folderName
                 Write-Success "Created folder: $folderName/"
             }
@@ -2724,47 +3315,61 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
             }
         }
         
-        # Move and (optionally) rename files into the folder
-        foreach ($rename in ($group.Group | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne $_.SeriesFolder })) {
-            try {
-                # Respect skip-renaming option 13
-                $targetName = if ($script:skipRenaming) { $rename.File.Name } else { $rename.NewName }
-                $targetPath = Join-Path $folderName $targetName
-                $originalPath = $rename.File.FullName
+		# Move and (optionally) rename files into the folder
+		foreach ($rename in ($group.Group | Where-Object { $_.File.Name -ne $_.NewName -or $_.File.DirectoryName -ne $_.SeriesFolder })) {
+			try {
+				# Respect skip-renaming option 13
+				$targetName = if ($script:skipRenaming) { $rename.File.Name } else { Sanitize-FileName $rename.NewName }
+				# If movie, enforce canonical filename for Plex: "Series - Title (Year)"
+				if ($rename.Episode -and $rename.Episode.SeriesEpisode -match $script:movieCodeRegex) {
+					$seriesNoYear = if ($script:seriesNameDisplay) { ($script:seriesNameDisplay -replace '\s*\(.*\)$','') } else { "Series" }
+					$year = $null
+					if ($rename.Episode.AirDate -and $rename.Episode.AirDate -ne "") {
+						try { $year = ([DateTime]::Parse($rename.Episode.AirDate)).Year } catch { $year = $null }
+					}
+					$suffix = if ($year) { " ($year)" } else { "" }
+					$targetName = Sanitize-FileName "$seriesNoYear - $($rename.Episode.Title)$suffix$($rename.File.Extension)"
+				}
+				$targetPath = Join-Path $folderName $targetName
+				$originalPath = $rename.File.FullName
+
+				# Assert root boundaries before moving
+				Assert-PathUnderRoot -Path $targetPath
+				Assert-PathUnderRoot -Path $originalPath
 
                 # Skip if target equals current full path (true no-op)
 					$targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $folderName $targetName))
 					if ($targetFullPath -eq $rename.File.FullName) { continue }
 
-                if (Test-Path $targetPath) {
-                    Write-Warning "Target file already exists: $targetPath"
-                    continue
-                }
+				if (Test-Path -LiteralPath $targetPath) {
+					Write-Warning "Target file already exists: $targetPath"
+					continue
+				}
                 
-                	# Journal move/rename for restore
-                	Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
-                	Move-Item -Path $rename.File.FullName -Destination $targetPath
-				$didRename = (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName))
+				# Journal move/rename for restore
+			Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
+			Move-Item -LiteralPath $rename.File.FullName -Destination $targetPath -ErrorAction Stop
+				$didRename = ($rename.File.Name -ne $targetName)
 				if ($didRename) {
-					Write-Success "Organised: $($rename.File.Name) -> $folderName/$($rename.NewName)"
+					Write-Success "Organised: $($rename.File.Name) -> $folderName/$targetName"
 				} else {
 					Write-Success "Moved: $($rename.File.Name) -> $folderName/"
 				}
-                # Process sidecars if enabled
-                if ($processSidecars) {
-                	if ($script:skipRenaming) {
-                		Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderName
-                	} else {
-                		RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
-                	}
-                }
+				# Process sidecars if enabled
+				if ($processSidecars) {
+					if ($script:skipRenaming) {
+						Move-AssociatedSidecars -VideoPath $originalPath -DestinationDir $folderName
+					} else {
+						RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
+					}
+				}
 				$successCount++
-            }
-            catch {
-                Write-Error "Failed to organise $($rename.File.Name): $($_.Exception.Message)"
-                $errorCount++
-            }
-        }
+			}
+			catch {
+				Write-Error "Failed to organise $($rename.File.Name): $($_.Exception.Message)"
+				$errorCount++
+			}
+		}
     }
     
     Clear-VideoFilesCache
@@ -2911,37 +3516,48 @@ function Show-FinalSummaryAndConfirm($report, $organisePlex = $false, $moveDupli
                 		$seasonMatch = [regex]::Match($_.Name, '(?i)Season\s+(\d+)')
                 		if ($seasonMatch.Success) { [int]$seasonMatch.Groups[1].Value } else { 9999 }
                 	}, Name
-                foreach ($group in $groupedRenames) {
-                    Write-Info "[FOLDER] $($group.Name)/"
-                	# Sort files inside folder by series code and episode number
-                	$sortedItems = @($group.Group) |
-                		Sort-Object {
-                			if ($_.Episode -and $_.Episode.SeriesEpisode) { $_.Episode.SeriesEpisode } else { 's99e99' }
-                		}, {
-                			if ($_.Episode -and $_.Episode.Number) { [int]$_.Episode.Number } else { [int]::MaxValue }
-                		}, {
-                			$_.File.Name
-                		}
-                    foreach ($rename in $sortedItems) {
-                    	$rootPath = (Get-Location).Path
-                    	$isFolderOnly = ($script:skipRenaming -or ($rename.File.Name -eq $rename.NewName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder)))
-                        if ($isFolderOnly) {
-                            # Folder-only move: show the filename without arrow
-                            Write-Host "   $($rename.File.Name)"
-                        } else {
-                            # Actual rename (name changes)
-                            Write-Host "   " -NoNewline
-                            if ($rename.HasDiscrepancy) {
-                            	$null = Write-FilenameWithMismatchHighlight $rename.File.Name $rename.DiscrepancyDetails
-                            } else {
-                            	Write-Label "$($rename.File.Name)" -NoNewline
-                            }
-                            Write-Warning " -> " -NoNewline
-                            Write-Success "$($rename.NewName)"
-                        }
-                    }
-                    Write-Host ""
-                }
+				foreach ($group in $groupedRenames) {
+					Write-Info "[FOLDER] $($group.Name)/"
+					# Sort files inside folder by series code and episode number
+					$sortedItems = @($group.Group) |
+						Sort-Object {
+							if ($_.Episode -and $_.Episode.SeriesEpisode) { $_.Episode.SeriesEpisode } else { 's99e99' }
+						}, {
+							if ($_.Episode -and $_.Episode.Number) { [int]$_.Episode.Number } else { [int]::MaxValue }
+						}, {
+							$_.File.Name
+						}
+					foreach ($rename in $sortedItems) {
+						$rootPath = (Get-Location).Path
+						# Compute canonical preview target for movies
+						$previewTargetName = $rename.NewName
+						if ($rename.Episode -and $rename.Episode.SeriesEpisode -match $script:movieCodeRegex) {
+							$seriesNoYear = if ($script:seriesNameDisplay) { ($script:seriesNameDisplay -replace '\s*\(.*\)$','') } else { "Series" }
+							$year = $null
+							if ($rename.Episode.AirDate -and $rename.Episode.AirDate -ne "") {
+								try { $year = ([DateTime]::Parse($rename.Episode.AirDate)).Year } catch { $year = $null }
+							}
+							$suffix = if ($year) { " ($year)" } else { "" }
+							$previewTargetName = Sanitize-FileName "$seriesNoYear - $($rename.Episode.Title)$suffix$($rename.File.Extension)"
+						}
+						$isFolderOnly = ($script:skipRenaming -or ($rename.File.Name -eq $previewTargetName -and $rename.File.DirectoryName -ne (Join-Path $rootPath $rename.SeriesFolder)))
+						if ($isFolderOnly) {
+							# Folder-only move: show the filename without arrow
+							Write-Host "   $($rename.File.Name)"
+						} else {
+							# Actual rename (name changes)
+							Write-Host "   " -NoNewline
+							if ($rename.HasDiscrepancy) {
+								$null = Write-FilenameWithMismatchHighlight $rename.File.Name $rename.DiscrepancyDetails
+							} else {
+								Write-Label "$($rename.File.Name)" -NoNewline
+							}
+							Write-Warning " -> " -NoNewline
+							Write-Success "$previewTargetName"
+						}
+					}
+					Write-Host ""
+				}
             } else {
                 # Show folder-style list for consistency (non-Plex -> current directory)
                 Write-Info "[FOLDER] ./"
@@ -3464,44 +4080,70 @@ function Verify-Library($namingFormat = 1) {
 
 # Main execution
 function Main {
-    Initialise-SeriesContext
-    # Defer folder creation; only create when actually moving files
+	# Set starting directory: prefer -StartDir, else use last from config
+	try {
+		if ($StartDir) {
+			$resolvedStart = [System.IO.Path]::GetFullPath($StartDir)
+			if (Test-Path -LiteralPath $resolvedStart) {
+				Set-Location -LiteralPath $resolvedStart
+				# Update config so recents/current reflect this start
+				Save-RecentFolder $resolvedStart
+				Save-CurrentFolder $resolvedStart
+			} else {
+				Write-Warning "StartDir not found: $resolvedStart. Falling back to last used folder."
+				$cfg = Load-Config
+				$last = $cfg.current_folder
+				if ($last -and (Test-Path -LiteralPath $last)) { Set-Location -LiteralPath $last }
+			}
+		} else {
+			$cfg = Load-Config
+			$last = $cfg.current_folder
+			if ($last -and (Test-Path -LiteralPath $last)) { Set-Location -LiteralPath $last }
+		}
+	} catch {}
+		Initialise-SeriesContext
+		# Defer folder creation; only create when actually moving files
     
-    do {
-        Show-MainMenu
-        do {
-            $choice = Read-Host "Choose option (1-6)"
-            $validChoice = $choice -match '^[1-6]$'
-            if (-not $validChoice) {
-                Write-Warning "Please enter a number between 1 and 6"
-            }
-        } while (-not $validChoice)
+	do {
+		Show-MainMenu
+		do {
+			$choice = Read-Host "Choose option (1-4, W/R/S or Q)"
+			$validChoice = $choice -match '^[1-4WwQqRrSs]$'
+			if (-not $validChoice) {
+				Write-Warning "Please enter 1-4, 'W' to change folder, 'R' restore points, 'S' CSV selection, or 'Q' to quit"
+			}
+		} while (-not $validChoice)
         
-        switch ($choice) {
-            "1" {
-                Quick-RenameAndCleanup
-            }
-            "2" {
-                Guided-CustomRenameAndCleanup
-            }
-            "3" {
-                Verify-Library
-            }
-            "4" {
-                Cleanup-UnrecognisedFiles
-            }
-            "5" {
-                Manage-RestorePoints
-            }
-            "6" {
-                Write-Success "Goodbye!"
-                return
-            }
-            default {
-                Write-Warning "Invalid choice. Please select 1-6."
-            }
-        }
-    } while ($true)
+			switch ($choice) {
+				"1" {
+					Quick-RenameAndCleanup
+				}
+				"2" {
+					Guided-CustomRenameAndCleanup
+				}
+				"3" {
+					Verify-Library
+				}
+				"4" {
+					Cleanup-UnrecognisedFiles
+				}
+				"R" { Manage-RestorePoints }
+				"r" { Manage-RestorePoints }
+				"S" { Initialise-SeriesContext -ForceSelection }
+				"s" { Initialise-SeriesContext -ForceSelection }
+				"W" {
+					Change-WorkingFolder
+				}
+				"w" {
+					Change-WorkingFolder
+				}
+				"Q" { Write-Success "Goodbye!"; return }
+				"q" { Write-Success "Goodbye!"; return }
+				default {
+					Write-Warning "Invalid choice. Please select 1-6, 'W' or 'Q'."
+				}
+			}
+		} while ($true)
 }
 
 # === Restore points ===
@@ -3524,11 +4166,19 @@ function Begin-RestorePoint([string]	$label) {
 
 function Record-RestoreOp([string]	$type, [string]	$from = $null, [string]	$to = $null, [string]	$path = $null) {
     if (-not $script:currentRestorePoint) { return }
+    $root = (Get-Location).Path
+    $rootFull = [System.IO.Path]::GetFullPath($root)
+    $resolve = {
+    	param($p)
+    	if (-not $p) { return $null }
+    	if ([System.IO.Path]::IsPathRooted($p)) { return [System.IO.Path]::GetFullPath($p) }
+    	return [System.IO.Path]::GetFullPath((Join-Path $rootFull $p))
+    }
     $entry = @{ 
     	type = $type; 
-    	from = $(if ($from) { [System.IO.Path]::GetFullPath($from) } else { $null }); 
-    	to = $(if ($to) { [System.IO.Path]::GetFullPath($to) } else { $null }); 
-    	path = $(if ($path) { [System.IO.Path]::GetFullPath($path) } else { $null }); 
+		from = $(& $resolve $from);
+		to = $(& $resolve $to);
+		path = $(& $resolve $path);
     	timestamp = (Get-Date).ToString("o") 
     } | ConvertTo-Json -Compress
     Add-Content -LiteralPath $script:currentRestorePoint -Value $entry
@@ -3625,7 +4275,9 @@ function Undo-LastRestorePoint {
 					$src = $op.to; $dst = $op.from
 					if (Test-Path -LiteralPath $src) {
 						Ensure-FolderExists ([System.IO.Path]::GetDirectoryName($dst))
-						Move-Item -LiteralPath $src -Destination $dst -Force
+						Assert-PathUnderRoot -Path $dst
+						Assert-PathUnderRoot -Path $src
+						Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
 						Write-Success "Undone: $src -> $dst"
 					} else {
 						Write-Warning "Skip: missing $src"
