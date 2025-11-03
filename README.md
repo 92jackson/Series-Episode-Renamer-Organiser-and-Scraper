@@ -8,9 +8,11 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 - [Download the latest release ZIP for this tool.](https://github.com/92jackson/episode-organiser/releases)
 - Extract the ZIP into the same folder where your series video files are stored.
-- Put the series CSV file in that same folder (if you have one, if not, use the optiion to generate one).
+- Put the series CSV file in that same folder (if you have one, if not, use the option to generate one).
 - Double‑click `episode_organiser.ps1` to start.
 - Follow the on‑screen prompts. No changes are made until you confirm.
+
+![Screenshot](https://i.ibb.co/LXcqBmxT/2.png)
 
 ### Command‑line flags
 
