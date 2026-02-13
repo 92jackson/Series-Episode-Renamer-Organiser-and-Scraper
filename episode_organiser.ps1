@@ -1,6 +1,6 @@
 <#
 Repo:		 https://github.com/92jackson/episode-organiser
-Ver:		 1.1.1
+Ver:		 1.2.0
 Support:	 https://discord.gg/e3eXGTJbjx
 
 	Episode Organiser for Plex-style TV series management
@@ -13,8 +13,7 @@ Support:	 https://discord.gg/e3eXGTJbjx
 	- Supports filenames containing multiple episode codes (e.g. `S01E01-E02`)
 
 	Usage:
-	& .\episode_organiser.ps1 -StartDir ".\test_series\Thomas & Friends (1984)\Season 1" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
-	& .\episode_organiser.ps1 -StartDir "E:\Media\Shows\Your Series\Season 1" -LoadCsvPath "E:\path\to\datasheet.csv"
+	& .\episode_organiser.ps1 -StartDir "E:\Media\Shows\Your Series" -LoadCsvPath "E:\path\to\datasheet.csv"
 	& .\episode_organiser.ps1
 
 	Parameters:
@@ -28,6 +27,15 @@ Support:	 https://discord.gg/e3eXGTJbjx
 	- Cleanup folders: `cleanup\duplicates\` and `cleanup\unknown\`
 	- Restore points: `cleanup\restore_points\`, one `.jsonl` per operation
 	- Sidecars moved/renamed with videos; thumbnails use `-thumb` style by default
+
+	Changes:
+	1.2.0-
+	- Title-led matching now scores all candidates and picks the closest title (for when a series has multiple episodes with similar titles)
+	- Similarity blends token overlap and edit distance to avoid near-name collisions
+	- In title match mode, episode codes now only break near-ties
+	- Linux/pwsh: fix parsing in Normalise-Text by switching to double-quoted -replace patterns
+	- Cross-platform root checks: use platform separators in Assert-PathUnderRoot/Is-PathUnderRoot
+	- Manual path entry: accept drag-and-drop quoted paths for new working folder
 #>
 
 [CmdletBinding()]
@@ -322,7 +330,7 @@ function Initialise-SeriesContext {
 		Write-Host ""
 		Write-Info "Don't see your series listed? Press [C] to download the episode list."
 		Write-Host ""
-		Write-Info "Multiple .csv files detected (paths shown for clarity):"
+		Write-Info "Multiple .csv files detected:"
 		# Build selection items with relative paths to avoid confusion across folders
 		$selectionItems = @()
 		foreach ($f in $csvFiles) {
@@ -506,12 +514,67 @@ function Normalise-Text($text) {
 	# - Convert curly apostrophes to straight
 	# - Treat '&' as the word 'and' (even without surrounding spaces)
 	# - Convert all hyphens to spaces
-	$pre = $text -replace '’', "'"
-	$pre = $pre -replace '&', ' and '
-	$pre = $pre -replace '-', ' '
+	$pre = $text -replace "’", "'"
+	$pre = $pre -replace "&", " and "
+	$pre = $pre -replace "-", " "
 	# Convert to lowercase, remove all non-alphanumeric characters except spaces, normalize spaces, trim
 	$normalized = $pre.ToLower() -replace '[^\w\s]', '' -replace '\s+', ' '
 	return $normalized.Trim()
+}
+
+function Get-LevenshteinDistance($s, $t) {
+	$s = if ($s) { [string]$s } else { "" }
+	$t = if ($t) { [string]$t } else { "" }
+	$lenS = $s.Length
+	$lenT = $t.Length
+	if ($lenS -eq 0) { return $lenT }
+	if ($lenT -eq 0) { return $lenS }
+	$prev = New-Object int[] ($lenT + 1)
+	$curr = New-Object int[] ($lenT + 1)
+	for ($j = 0; $j -le $lenT; $j++) { $prev[$j] = $j }
+	for ($i = 1; $i -le $lenS; $i++) {
+		$curr[0] = $i
+		$si = $s[$i - 1]
+		for ($j = 1; $j -le $lenT; $j++) {
+			$cost = if ($si -eq $t[$j - 1]) { 0 } else { 1 }
+			$del = $prev[$j] + 1
+			$ins = $curr[$j - 1] + 1
+			$sub = $prev[$j - 1] + $cost
+			$min = $del
+			if ($ins -lt $min) { $min = $ins }
+			if ($sub -lt $min) { $min = $sub }
+			$curr[$j] = $min
+		}
+		$tmp = $prev
+		$prev = $curr
+		$curr = $tmp
+	}
+	return $prev[$lenT]
+}
+
+function Get-StringSimilarityScore($a, $b) {
+	$na = if ($a) { [string]$a } else { "" }
+	$nb = if ($b) { [string]$b } else { "" }
+	$ta = @($na -split '\s+' | Where-Object { $_ -and $_ -ne "" })
+	$tb = @($nb -split '\s+' | Where-Object { $_ -and $_ -ne "" })
+	$setA = @{}
+	foreach ($t in $ta) { if (-not $setA.ContainsKey($t)) { $setA[$t] = $true } }
+	$setB = @{}
+	foreach ($t in $tb) { if (-not $setB.ContainsKey($t)) { $setB[$t] = $true } }
+	$interCount = 0
+	foreach ($k in $setA.Keys) { if ($setB.ContainsKey($k)) { $interCount++ } }
+	$unionCount = $setA.Count
+	foreach ($k in $setB.Keys) { if (-not $setA.ContainsKey($k)) { $unionCount++ } }
+	$jaccard = if ($unionCount -gt 0) { $interCount / $unionCount } else { 0.0 }
+	$maxLen = [math]::Max($na.Length, $nb.Length)
+	$lev = Get-LevenshteinDistance $na $nb
+	$ratio = if ($maxLen -gt 0) { 1.0 - ($lev / $maxLen) } else { 0.0 }
+	$substrBoost = 0.0
+	if ($na -and $nb -and ($na -like "*$nb*" -or $nb -like "*$na*")) { $substrBoost = 0.05 }
+	$score = (0.6 * $jaccard) + (0.4 * $ratio) + $substrBoost
+	if ($score -gt 1.0) { $score = 1.0 }
+	if ($score -lt 0.0) { $score = 0.0 }
+	return $score
 }
 
 # Load episode data from CSV with optimised lookup tables
@@ -604,23 +667,22 @@ function Initialise-Directories {
 
 # Assert that a path resolves under the current working directory (root)
 function Assert-PathUnderRoot([string]	$path) {
-	$root = (Get-Location).Path
-	$rootFull = [System.IO.Path]::GetFullPath($root)
+	$rootFull = [System.IO.Path]::GetFullPath((Get-Location).Path)
 	$destFull = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
-	# Ensure trailing separator when doing prefix compare to avoid false positives
-	$rootPrefix = if ($rootFull.EndsWith('\')) { $rootFull } else { "$rootFull\" }
-	if ((-not $destFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) -and ($destFull -ne $rootFull)) {
+	$sep = [System.IO.Path]::DirectorySeparatorChar
+	$rootWithSep = $rootFull.TrimEnd($sep) + $sep
+	if (-not ($destFull.StartsWith($rootWithSep, [StringComparison]::OrdinalIgnoreCase) -or $destFull -eq $rootFull)) {
 		throw "Refusing to operate outside root: $destFull (root: $rootFull)"
 	}
 }
 
 # Helper: boolean check if a path is under current root
 function Is-PathUnderRoot([string]	$path) {
-	$root = (Get-Location).Path
-	$rootFull = [System.IO.Path]::GetFullPath($root)
+	$rootFull = [System.IO.Path]::GetFullPath((Get-Location).Path)
 	$destFull = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
-	$rootPrefix = if ($rootFull.EndsWith('\')) { $rootFull } else { "$rootFull\" }
-	return (($destFull -eq $rootFull) -or $destFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase))
+	$sep = [System.IO.Path]::DirectorySeparatorChar
+	$rootWithSep = $rootFull.TrimEnd($sep) + $sep
+	return (($destFull -eq $rootFull) -or $destFull.StartsWith($rootWithSep, [StringComparison]::OrdinalIgnoreCase))
 }
 
 # Detect reserved Windows device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
@@ -1677,6 +1739,12 @@ function Choose-RecentFolder {
 function Enter-ManualPath {
 	$newPath = Read-Host "Enter new folder path"
 	if ([string]::IsNullOrWhiteSpace($newPath)) { Write-Warning "No path entered."; return $null }
+	$newPath = $newPath.Trim()
+	if ($newPath.Length -ge 2) {
+		if ((($newPath.StartsWith('"') -and $newPath.EndsWith('"')) -or ($newPath.StartsWith("'") -and $newPath.EndsWith("'")))) {
+			$newPath = $newPath.Substring(1, $newPath.Length - 2)
+		}
+	}
 	try { $resolved = [System.IO.Path]::GetFullPath($newPath) } catch { Write-Error "Invalid path: $newPath"; return $null }
 	if (-not (Test-Path -LiteralPath $resolved)) { Write-Error "Folder not found: $resolved"; return $null }
 	return $resolved
@@ -1835,21 +1903,40 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 						$preferred = $candidates | Where-Object { $_ -match "\bpart\s+$exPart\b" } | Select-Object -First 1
 						if ($preferred) { return $script:episodesByTitle[$preferred] }
 					}
-					# As a tie-breaker, if an episode code is present, prefer candidate with that episode's title
+					# Score all candidates and select the best by similarity
+					$bestKey = $null
+					$bestScore = -1.0
+					$candidateScores = @{}
+					foreach ($key in $candidates) {
+						$score = Get-StringSimilarityScore $normalisedTitle $key
+						$candidateScores[$key] = $score
+						if ($score -gt $bestScore) {
+							$bestScore = $score
+							$bestKey = $key
+						} elseif ($score -eq $bestScore -and $bestKey) {
+							if ($key.Length -gt $bestKey.Length) { $bestKey = $key }
+						}
+					}
+					# Only if there is effectively a tie, use an episode code to break the tie
 					$code = Extract-EpisodeCode $file.Name
-					if ($code) {
+					if ($code -and $bestKey) {
 						$canonical = $code.ToLower()
-						# Map s00eNN extracted from filename to mNN dataset code for movies
 						$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
 						if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
 						if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
 							$ep = $script:episodesBySeriesEpisode[$canonical]
 							$matchKey = Normalise-Text $ep.Title
-							$matchedCandidate = $candidates | Where-Object { $_ -eq $matchKey } | Select-Object -First 1
-							if ($matchedCandidate) { return $script:episodesByTitle[$matchedCandidate] }
+							if ($candidates -contains $matchKey) {
+								$codeScore = if ($candidateScores.ContainsKey($matchKey)) { $candidateScores[$matchKey] } else { Get-StringSimilarityScore $normalisedTitle $matchKey }
+								# Margin within which we consider it a tie
+								$epsilon = 0.02
+								if ([math]::Abs($codeScore - $bestScore) -le $epsilon) {
+									$bestKey = $matchKey
+								}
+							}
 						}
 					}
-					return $script:episodesByTitle[$candidates[0]]
+					if ($bestKey) { return $script:episodesByTitle[$bestKey] }
 				}
 			} else {
 				# Only fallback to episode code if no title could be extracted
@@ -1908,7 +1995,38 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 						$preferred = $candidates | Where-Object { $_ -match "\bpart\s+$exPart\b" } | Select-Object -First 1
 						if ($preferred) { return $script:episodesByTitle[$preferred] }
 					}
-					return $script:episodesByTitle[$candidates[0]]
+					$bestKey = $null
+					$bestScore = -1.0
+					$candidateScores = @{}
+					foreach ($key in $candidates) {
+						$score = Get-StringSimilarityScore $normalisedTitle $key
+						$candidateScores[$key] = $score
+						if ($score -gt $bestScore) {
+							$bestScore = $score
+							$bestKey = $key
+						} elseif ($score -eq $bestScore -and $bestKey) {
+							if ($key.Length -gt $bestKey.Length) { $bestKey = $key }
+						}
+					}
+					# Optional: if episode code points to a candidate with effectively the same score, allow it as tie-breaker
+					$code = Extract-EpisodeCode $file.Name
+					if ($code -and $bestKey) {
+						$canonical = $code.ToLower()
+						$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+						if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
+						if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
+							$ep = $script:episodesBySeriesEpisode[$canonical]
+							$matchKey = Normalise-Text $ep.Title
+							if ($candidates -contains $matchKey) {
+								$codeScore = if ($candidateScores.ContainsKey($matchKey)) { $candidateScores[$matchKey] } else { Get-StringSimilarityScore $normalisedTitle $matchKey }
+								$epsilon = 0.02
+								if ([math]::Abs($codeScore - $bestScore) -le $epsilon) {
+									$bestKey = $matchKey
+								}
+							}
+						}
+					}
+					if ($bestKey) { return $script:episodesByTitle[$bestKey] }
 				}
 			}
 		}
