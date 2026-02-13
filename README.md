@@ -71,7 +71,7 @@ Advanced usage:
 
 ### Windows: Unblock downloaded scripts
 
-- If you downloaded the ZIP from the internet, Windows may block the files.
+- Windows will usually block script files downloaded from the internet.
 - To allow execution, open PowerShell in the folder and run:
 
   ```powershell
