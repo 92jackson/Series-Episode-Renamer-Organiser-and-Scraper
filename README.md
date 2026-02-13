@@ -51,15 +51,15 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 Basic usage:
 
-    - Run `episode_organiser.ps1`
-    - On the CSV selection screen, type Option `C`
-    - This will start the episode scraper, search for your series and follow the prompts
+- Run `episode_organiser.ps1`
+- On the CSV selection screen, type Option `C`
+- This will start the episode scraper, search for your series and follow the prompts
 
 Advanced usage:
 
-    ```powershell
-    powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps1 -Query "Thomas & Friends" -YearFilter 1984 -AutoConfirm
-    ```
+```powershell
+powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps1 -Query "Thomas & Friends" -YearFilter 1984 -AutoConfirm
+```
 
 ## Subtitles & Thumbnails handling (sidecars)
 
