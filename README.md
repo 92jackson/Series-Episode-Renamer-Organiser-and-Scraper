@@ -6,17 +6,20 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 ## What it does
 
+- Takes directories containing TV series and cleans up their filenames.
 - Builds Plex‑compatible folders: `Series Name/Season N/`.
-- Renames files like: `Series - sXXeXX - Title`.
+- Renames files to set formats, i.e: `Series - sXXeXX - Title`.
 - Highlights duplicates and unknown files for you to decide.
 - Asks for confirmation before making any changes.
-- Finds, renames, and moves matching subtitle and thumbnail sidecars to align with final video filenames.
+- Finds, renames, and moves matching subtitle and thumbnail (sidecars) to align with final video filenames.
 
 ## Quick Start
 
 - [Download the latest release ZIP for this tool.](https://github.com/92jackson/episode-organiser/releases)
 - Extract the ZIP (either into the same folder where your series video files are stored for simplicity, or elsewhere).
-- Double‑click `episode_organiser.ps1` to start (you may need to [unblock the script first](#windows-unblock-downloaded-scripts))
+- Double‑click `run_gui.bat` to start in GUI mode (the batch file unblocks scripts automatically)
+- Double‑click `run_cl.bat` to start in console mode (the batch file unblocks scripts automatically)
+- If you want to run the PowerShell script directly, use `bin\episode_organiser.ps1` (you may need to [unblock the script first](#windows-unblock-downloaded-scripts))
 - Follow the on‑screen prompts. No changes are made until you confirm.
 
 - If you extracted the script to somewhere other than the folder where your video files are stored, you can change the current working directory (CWD) via the main menu.
@@ -29,7 +32,7 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
   ```powershell
   # Start in a target folder and preload a CSV
-  powershell -ExecutionPolicy Bypass -File .\episode_organiser.ps1 -StartDir "C:\Downloads\" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
+  powershell -ExecutionPolicy Bypass -File .\bin\episode_organiser.ps1 -StartDir "C:\Downloads\" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
   ```
 
 ### What is the series CSV?
@@ -46,19 +49,19 @@ _Originally created to help cleanup and organise the brilliant [Thomas and Frien
 
 ### Generate a CSV via TMDB scrape
 
-- Use `episode_datasheets\episode_scraper.ps1` to create a series CSV from TMDB.
+- Use `bin\episode_scraper.ps1` to create a series CSV from TMDB.
 - Output is saved as `episode_datasheets\series_name_(year).csv`.
 
 Basic usage:
 
-- Run `episode_organiser.ps1`
+- Run `bin\episode_organiser.ps1`
 - On the CSV selection screen, type Option `C`
 - This will start the episode scraper, search for your series and follow the prompts
 
 Advanced usage:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps1 -Query "Thomas & Friends" -YearFilter 1984 -AutoConfirm
+	powershell -ExecutionPolicy Bypass -File .\bin\episode_scraper.ps1 -Query "Thomas & Friends" -YearFilter 1984 -AutoConfirm
 ```
 
 ## Subtitles & Thumbnails handling (sidecars)
@@ -72,12 +75,13 @@ powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps
 ### Windows: Unblock downloaded scripts
 
 - Windows will usually block script files downloaded from the internet.
-- To allow execution, open PowerShell in the folder and run:
+- If you run `run_gui.bat` or `run_cl.bat`, they will unblock the required scripts for you.
+- To allow execution manually, open PowerShell in the folder and run:
 
   ```powershell
   # Unblock the organiser and scraper scripts
-  Unblock-File -Path .\episode_organiser.ps1
-  Unblock-File -Path .\episode_datasheets\episode_scraper.ps1
+  Unblock-File -Path .\bin\episode_organiser.ps1
+  Unblock-File -Path .\bin\episode_scraper.ps1
 
   # Or unblock everything in the folder (including subfolders)
   Get-ChildItem -Recurse -File | Unblock-File
@@ -86,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps
 - You can also run via PowerShell with execution policy bypass:
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -File .\episode_organiser.ps1
+  powershell -ExecutionPolicy Bypass -File .\bin\episode_organiser.ps1
   ```
 
 ### Running on Linux (PowerShell 7)
@@ -94,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File .\episode_datasheets\episode_scraper.ps
 - Install PowerShell 7 (`pwsh`) using your distro’s package manager or from Microsoft’s packages. Then run:
 
   ```bash
-  pwsh -ExecutionPolicy Bypass -File ./episode_organiser.ps1
+  pwsh -ExecutionPolicy Bypass -File ./bin/episode_organiser.ps1
   ```
 
 ## Repository
