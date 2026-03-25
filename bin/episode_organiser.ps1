@@ -24,7 +24,7 @@ Support:	 https://discord.gg/e3eXGTJbjx
 	"ep_no","series_ep_code","title","air_date"
 
 	Notes:
-	- Cleanup folders: `cleanup\duplicates\` and `cleanup\unknown\`
+	- Clean-up folders: `cleanup\duplicates\`, `cleanup\unknown\` and `cleanup\orphan\`
 	- Restore points: `cleanup\restore_points\`, one `.jsonl` per operation
 	- Sidecars moved/renamed with videos; thumbnails use `-thumb` style by default
 
@@ -40,11 +40,14 @@ Support:	 https://discord.gg/e3eXGTJbjx
 	- GUI mode added. To run, use -Gui flag or launch via run_gui.bat
 	-- Options set within the GUI are persistent and apply to future runs
 	-- New GUI only options added:
-	  - Cleanup orphan files (unknown files and unused sidecars) to `cleanup\orphan\`
+	  - Clean-up orphan files (unknown files and unused sidecars) to `cleanup\orphan\`
 	  - Create series folder inside the working directory (available when using Plex folders)
 	  - Move matches to working directory (available when not using Plex folders)
 	-- Adds the ability to create manual episode matches
-	-- View missing episodes in your library and see detected orphaned files via seperate dialogs within the main UI
+	-- View missing episodes in your library and see detected orphaned files via separate dialogs within the main UI
+	2.1.0-
+	- Added support for abnormally long file paths
+	- Added better visual feedback during the rename process (GUI mode)
 #>
 
 [CmdletBinding()]
@@ -764,6 +767,26 @@ function Is-PathUnderRoot([string]	$path) {
 	return (($destFull -eq $rootFull) -or $destFull.StartsWith($rootWithSep, [StringComparison]::OrdinalIgnoreCase))
 }
 
+function Convert-ToLongPath([string]	$path) {
+	if ([string]::IsNullOrWhiteSpace($path)) { return $path }
+	$root = (Get-Location).Path
+	$full = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $root $path)) }
+	if ($env:OS -ne 'Windows_NT') { return $full }
+	if ($full.StartsWith("\\?\\")) { return $full }
+	if ($full.StartsWith("\\\\")) { return "\\?\UNC\" + $full.Substring(2) }
+	return "\\?\" + $full
+}
+
+function Test-PathSafeFile([string]	$path) {
+	$full = Convert-ToLongPath $path
+	return [System.IO.File]::Exists($full)
+}
+
+function Test-PathSafeDir([string]	$path) {
+	$full = Convert-ToLongPath $path
+	return [System.IO.Directory]::Exists($full)
+}
+
 # Detect reserved Windows device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
 function Is-ReservedWindowsName([string]	$name) {
 	if ([string]::IsNullOrEmpty($name)) { return $false }
@@ -816,9 +839,9 @@ function Ensure-FolderExists($path) {
 	$rootFull = [System.IO.Path]::GetFullPath($root)
 	$fullTarget = if ([System.IO.Path]::IsPathRooted($path)) { [System.IO.Path]::GetFullPath($path) } else { [System.IO.Path]::GetFullPath((Join-Path $rootFull $path)) }
 	Assert-PathUnderRoot $fullTarget
-	if (-not (Test-Path -LiteralPath $fullTarget)) {
+	if (-not (Test-PathSafeDir $fullTarget)) {
 		# Create nested directories safely without migrating any existing folders
-		[System.IO.Directory]::CreateDirectory($fullTarget) | Out-Null
+		[System.IO.Directory]::CreateDirectory((Convert-ToLongPath $fullTarget)) | Out-Null
 		# If a restore point is active, record directory creation
 		if ($script:currentRestorePoint) {
 			Record-RestoreOp -type "create_dir" -path $fullTarget
@@ -1190,10 +1213,10 @@ function Move-OrphanedFilesToOrphan {
 				Ensure-FolderExists $destDir
 				Assert-PathUnderRoot -Path $destDir
 				$destPath = Join-Path $destDir $f.Name
-				if (Test-Path -LiteralPath $destPath) { continue }
+				if (Test-PathSafeFile $destPath) { continue }
 				Record-RestoreOp -type "move" -from $f.FullName -to $destPath
 				Assert-PathUnderRoot -Path $destPath
-				Move-Item -LiteralPath $f.FullName -Destination $destDir -Force -ErrorAction Stop
+				Move-Item -LiteralPath (Convert-ToLongPath $f.FullName) -Destination (Convert-ToLongPath $destDir) -Force -ErrorAction Stop
 			}
 			catch {
 				Write-Error "Failed to move $($f.Name): $($_.Exception.Message)"
@@ -1216,13 +1239,13 @@ function Move-OrphanedFilesToOrphan {
 				$rel = if ($dirFull -eq $rootFull) { "" } else { $dirFull.Substring($rootFull.Length).TrimStart('\\') }
 				if ([string]::IsNullOrEmpty($rel)) { continue }
 				$destPath = Join-Path $orphanFolder $rel
-				if (Test-Path -LiteralPath $destPath) { continue }
+				if (Test-PathSafeDir $destPath) { continue }
 				$destParent = Split-Path -Parent $destPath
 				Ensure-FolderExists $destParent
 				Assert-PathUnderRoot -Path $destParent
 				Record-RestoreOp -type "move" -from $d.FullName -to $destPath
 				Assert-PathUnderRoot -Path $destPath
-				Move-Item -LiteralPath $d.FullName -Destination $destPath -Force -ErrorAction Stop
+				Move-Item -LiteralPath (Convert-ToLongPath $d.FullName) -Destination (Convert-ToLongPath $destPath) -Force -ErrorAction Stop
 			}
 			catch {
 				Write-Warning "Failed to move folder $($d.FullName): $($_.Exception.Message)"
@@ -1333,7 +1356,7 @@ function RenameAndMove-Sidecars {
 		# Journal sidecar rename+move
 		Record-RestoreOp -type "move" -from $src -to $dest
 		Assert-PathUnderRoot -Path $dest
-		Move-Item -LiteralPath $src -Destination $dest -Force -ErrorAction Stop
+		Move-Item -LiteralPath (Convert-ToLongPath $src) -Destination (Convert-ToLongPath $dest) -Force -ErrorAction Stop
 		Write-Host $message
 	}
 }
@@ -1356,7 +1379,7 @@ function Move-AssociatedSidecars {
 			# Journal sidecar move
 			Record-RestoreOp -type "move" -from $f.FullName -to $dest
 			Assert-PathUnderRoot $dest
-			Move-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
+			Move-Item -LiteralPath (Convert-ToLongPath $f.FullName) -Destination (Convert-ToLongPath $dest) -Force -ErrorAction Stop
 			$root = (Get-Location).Path
 			$destFull = if ([System.IO.Path]::IsPathRooted($DestinationDir)) { [System.IO.Path]::GetFullPath($DestinationDir) } else { [System.IO.Path]::GetFullPath((Join-Path $root $DestinationDir)) }
 			$rootFull = [System.IO.Path]::GetFullPath($root)
@@ -3208,7 +3231,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 					} else {
 						Write-Success "Moved duplicate: $($moveFile.Name) -> cleanup/duplicates/"
 					}
-					Update-GuiRenameProgress $srcPath ("Duplicate: " + $moveFile.Name)
+					Update-GuiRenameProgress $srcPath ("Duplicate: " + $moveFile.Name) $true $dupTargetPath
 					# Move associated sidecars unchanged from original location
 					Move-AssociatedSidecars -VideoPath $srcPath -DestinationDir $duplicatesFolder
 					$successCount++
@@ -3236,7 +3259,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 				Assert-PathUnderRoot $unknownTargetPath
 				Move-Item -LiteralPath $file.FullName -Destination $unknownTargetPath -Force -ErrorAction Stop
                 Write-Success "Moved unmatched: $($file.Name) -> cleanup/unknown/"
-				Update-GuiRenameProgress $file.FullName ("Unmatched: " + $file.Name)
+				Update-GuiRenameProgress $file.FullName ("Unmatched: " + $file.Name) $true $unknownTargetPath
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $file.FullName -DestinationDir $unknownFolder
                 $successCount++
@@ -3328,7 +3351,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
                     Assert-PathUnderRoot -Path $originalPath
 				# Skip if target equals current full path (true no-op)
 				if ($targetPathAbs -eq $rename.File.FullName) {
-					Update-GuiRenameProgress $originalPath $rename.File.Name
+					Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetPathAbs
 					continue
 				}
 
@@ -3352,7 +3375,7 @@ function Execute-AllChanges($report, $moveDuplicates = $true, $moveUnknown = $tr
 				} else {
 					Write-Success "Moved: $($rename.File.Name) -> $folderName/"
 				}
-				Update-GuiRenameProgress $originalPath $rename.File.Name
+				Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetPathAbs
 				# Process sidecars if enabled
 				if ($processSidecars) {
 					if ($script:skipRenaming) {
@@ -3716,12 +3739,12 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 
 			# Skip if target equals current full path (true no-op)
 			if ($targetFullPath -eq $rename.File.FullName) {
-				Update-GuiRenameProgress $originalPath $rename.File.Name
+				Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetFullPath
 				continue
 			}
 			Assert-PathUnderRoot $targetPath
 			
-		if (Test-Path -LiteralPath $targetPath) {
+		if (Test-PathSafeFile $targetPath) {
 			Write-Warning "Target file already exists: $($targetName)"
 			Update-GuiRenameProgress $originalPath $rename.File.Name $false
 			continue
@@ -3731,7 +3754,7 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 			if ($moveMatchesToRoot -and $currentDir -ne $rootDir) {
 				Record-RestoreOp -type "move" -from $originalPath -to $targetPath
 				Assert-PathUnderRoot $targetPath
-				Move-Item -LiteralPath $rename.File.FullName -Destination $targetPath -ErrorAction Stop
+				Move-Item -LiteralPath (Convert-ToLongPath $rename.File.FullName) -Destination (Convert-ToLongPath $targetPath) -ErrorAction Stop
 				$didRename = (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName))
 				if ($didRename) {
 					Write-Success "Moved and renamed: $($rename.File.Name) -> ./$($rename.NewName)"
@@ -3749,7 +3772,7 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 				if (-not $script:skipRenaming -and ($rename.File.Name -ne $rename.NewName)) {
 					Record-RestoreOp -type "move" -from $originalPath -to $targetPath
 					Assert-PathUnderRoot $targetPath
-					Rename-Item -LiteralPath $rename.File.FullName -NewName $rename.NewName -ErrorAction Stop
+					Rename-Item -LiteralPath (Convert-ToLongPath $rename.File.FullName) -NewName $rename.NewName -ErrorAction Stop
 					Write-Success "Renamed: $($rename.File.Name) -> $($rename.NewName)"
 					if ($processSidecars) {
 						RenameAndMove-Sidecars -OriginalVideoPath $originalPath -FinalVideoPath $targetPath -ThumbStyle 'thumb'
@@ -3758,7 +3781,7 @@ function Execute-SimpleRenames($report, $moveDuplicates = $true, $moveUnknown = 
 					Write-Info "No rename for: $($rename.File.Name)"
 				}
 			}
-			Update-GuiRenameProgress $originalPath $rename.File.Name
+			Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetFullPath
 			$successCount++
 		}
 		catch {
@@ -3784,12 +3807,14 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
         Ensure-FolderExists $duplicatesFolder
         foreach ($dup in $report.Duplicates) {
             $moveFile = if ($dup.ConflictType -eq "Rename Collision") { $dup.OrigFile } else { if ($dup.KeepIA) { $dup.OrigFile } else { $dup.IAFile } }
+			$dupTargetPath = [System.IO.Path]::Combine($duplicatesFolder, $moveFile.Name)
+			$dupTargetPathFull = [System.IO.Path]::GetFullPath($dupTargetPath)
             try {
                 # Journal move for restore
                 Record-RestoreOp -type "move" -from $moveFile.FullName -to ([System.IO.Path]::Combine($duplicatesFolder, $moveFile.Name))
-				Move-Item -LiteralPath $moveFile.FullName -Destination $duplicatesFolder -Force -ErrorAction Stop
+				Move-Item -LiteralPath (Convert-ToLongPath $moveFile.FullName) -Destination (Convert-ToLongPath $duplicatesFolder) -Force -ErrorAction Stop
                 Write-Success "Moved duplicate: $($moveFile.Name) -> cleanup/duplicates/"
-				Update-GuiRenameProgress $moveFile.FullName ("Duplicate: " + $moveFile.Name)
+				Update-GuiRenameProgress $moveFile.FullName ("Duplicate: " + $moveFile.Name) $true $dupTargetPathFull
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $moveFile.FullName -DestinationDir $duplicatesFolder
                 $successCount++
@@ -3808,10 +3833,12 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
         foreach ($file in $report.UnmatchedFiles) {
             try {
                 # Journal move for restore
+				$unknownTargetPath = [System.IO.Path]::Combine($unknownFolder, $file.Name)
+				$unknownTargetPathFull = [System.IO.Path]::GetFullPath($unknownTargetPath)
                 Record-RestoreOp -type "move" -from $file.FullName -to ([System.IO.Path]::Combine($unknownFolder, $file.Name))
-				Move-Item -LiteralPath $file.FullName -Destination $unknownFolder -Force -ErrorAction Stop
+				Move-Item -LiteralPath (Convert-ToLongPath $file.FullName) -Destination (Convert-ToLongPath $unknownFolder) -Force -ErrorAction Stop
                 Write-Success "Moved unmatched: $($file.Name) -> cleanup/unknown/"
-				Update-GuiRenameProgress $file.FullName ("Unmatched: " + $file.Name)
+				Update-GuiRenameProgress $file.FullName ("Unmatched: " + $file.Name) $true $unknownTargetPathFull
                 # Move associated sidecars unchanged
                 Move-AssociatedSidecars -VideoPath $file.FullName -DestinationDir $unknownFolder
                 $successCount++
@@ -3860,7 +3887,7 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
         }
         
         # Create folder if it doesn't exist
-        if (-not (Test-Path -LiteralPath $folderName)) {
+        if (-not (Test-PathSafeDir $folderName)) {
             try {
                 Assert-PathUnderRoot -Path $folderName
                 Ensure-FolderExists $folderName
@@ -3897,11 +3924,11 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
                 # Skip if target equals current full path (true no-op)
 					$targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $folderName $targetName))
 					if ($targetFullPath -eq $rename.File.FullName) {
-						Update-GuiRenameProgress $originalPath $rename.File.Name
+						Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetFullPath
 						continue
 					}
 
-				if (Test-Path -LiteralPath $targetPath) {
+				if (Test-PathSafeFile $targetPath) {
 					Write-Warning "Target file already exists: $targetPath"
 					Update-GuiRenameProgress $originalPath $rename.File.Name $false
 					continue
@@ -3909,14 +3936,14 @@ function Execute-PlexOrganisation($report, $moveDuplicates = $true, $moveUnknown
                 
 				# Journal move/rename for restore
 			Record-RestoreOp -type "move" -from $rename.File.FullName -to $targetPath
-			Move-Item -LiteralPath $rename.File.FullName -Destination $targetPath -ErrorAction Stop
+			Move-Item -LiteralPath (Convert-ToLongPath $rename.File.FullName) -Destination (Convert-ToLongPath $targetPath) -ErrorAction Stop
 				$didRename = ($rename.File.Name -ne $targetName)
 				if ($didRename) {
 					Write-Success "Organised: $($rename.File.Name) -> $folderName/$targetName"
 				} else {
 					Write-Success "Moved: $($rename.File.Name) -> $folderName/"
 				}
-				Update-GuiRenameProgress $originalPath $rename.File.Name
+				Update-GuiRenameProgress $originalPath $rename.File.Name $true $targetFullPath
 				# Process sidecars if enabled
 				if ($processSidecars) {
 					if ($script:skipRenaming) {
@@ -5503,6 +5530,8 @@ function Start-GuiRenameProgress($form, $statusLabel, $progressBar, $grid, [int]
 		ProgressBar = $progressBar
 		Total = $total
 		Done = 0
+		Success = 0
+		Failed = 0
 		RowByPath = $rowByPath
 		PrevStatus = $statusLabel.Text
 	}
@@ -5515,10 +5544,15 @@ function Start-GuiRenameProgress($form, $statusLabel, $progressBar, $grid, [int]
 	[System.Windows.Forms.Application]::DoEvents()
 }
 
-function Update-GuiRenameProgress([string]$originalPath, [string]$displayText, [bool]$succeeded = $true) {
+function Update-GuiRenameProgress([string]$originalPath, [string]$displayText, [bool]$succeeded = $true, [string]$newPath = $null) {
 	$state = $script:guiRenameProgress
 	if (-not $state) { return }
 	$state.Done = [int]$state.Done + 1
+	if ($succeeded) {
+		$state.Success = [int]$state.Success + 1
+	} else {
+		$state.Failed = [int]$state.Failed + 1
+	}
 	$total = [int]$state.Total
 	$done = [int]$state.Done
 	if ($state.ProgressBar) {
@@ -5526,16 +5560,24 @@ function Update-GuiRenameProgress([string]$originalPath, [string]$displayText, [
 		$state.ProgressBar.Value = $val
 	}
 	if ($state.StatusLabel) {
-		$msg = "Running changes: $done/$total"
+		$msg = "Running changes: $done/$total | ok: $($state.Success) failed: $($state.Failed)"
 		if ($displayText) { $msg = "$msg | $displayText" }
 		$state.StatusLabel.Text = $msg
 	}
-	if ($succeeded -and $originalPath -and $state.RowByPath -and $state.RowByPath.ContainsKey($originalPath)) {
+	if ($originalPath -and $state.RowByPath -and $state.RowByPath.ContainsKey($originalPath)) {
 		$row = $state.RowByPath[$originalPath]
 		if ($row) {
 			$script:guiBulkToggle = $true
 			try {
-				$row.Cells["Select"].Value = $false
+				$row.DefaultCellStyle.ForeColor = if ($succeeded) { [System.Drawing.Color]::SeaGreen } else { [System.Drawing.Color]::Firebrick }
+				if ($newPath) {
+					$fileCell = $row.Cells["File"]
+					if ($fileCell) {
+						$fileCell.Value = [System.IO.Path]::GetFileName($newPath)
+						$fileCell.ToolTipText = $newPath
+					}
+				}
+				if ($succeeded) { $row.Cells["Select"].Value = $false }
 			} finally {
 				$script:guiBulkToggle = $false
 			}
@@ -5543,6 +5585,17 @@ function Update-GuiRenameProgress([string]$originalPath, [string]$displayText, [
 	}
 	if ($state.Form) { $state.Form.Refresh() }
 	[System.Windows.Forms.Application]::DoEvents()
+}
+
+function Get-GuiRenameProgressSummary {
+	$state = $script:guiRenameProgress
+	if (-not $state) { return $null }
+	return [PSCustomObject]@{
+		Total = [int]$state.Total
+		Done = [int]$state.Done
+		Success = [int]$state.Success
+		Failed = [int]$state.Failed
+	}
 }
 
 function Stop-GuiRenameProgress {
@@ -7233,6 +7286,7 @@ function Show-OrganiserGui {
 		Start-GuiRenameProgress $form $status $progressBar $grid $total
 		$form.UseWaitCursor = $true
 		$form.Refresh()
+		$summary = $null
 		try {
 			Begin-RestorePoint "GUI Organise"
 			$processSidecars = $chkSidecars.Checked
@@ -7264,13 +7318,23 @@ function Show-OrganiserGui {
 				Move-OrphanedFilesToOrphan -TreatSidecarsAsOrphans $orphanSidecars
 			}
 		} finally {
+			$summary = Get-GuiRenameProgressSummary
 			$script:guiApplyWithoutSeriesFolder = $false
 			End-RestorePoint
 			Stop-GuiRenameProgress
 			$form.UseWaitCursor = $false
 		}
-		[System.Windows.Forms.MessageBox]::Show("Completed.")
-		$btnAnalyze.PerformClick()
+		if ($summary) {
+			$msg = "Completed."
+			if ($summary.Failed -gt 0) {
+				$msg = "Completed with errors.`n`nSuccessful: $($summary.Success)`nFailed: $($summary.Failed)`nProcessed: $($summary.Done)/$($summary.Total)"
+			} else {
+				$msg = "Completed successfully.`n`nSuccessful: $($summary.Success)`nProcessed: $($summary.Done)/$($summary.Total)"
+			}
+			[System.Windows.Forms.MessageBox]::Show($msg)
+		} else {
+			[System.Windows.Forms.MessageBox]::Show("Completed.")
+		}
 	})
 
 	$btnClose.Add_Click({ $form.Close() })
